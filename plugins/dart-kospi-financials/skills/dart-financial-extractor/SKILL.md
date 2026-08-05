@@ -6,9 +6,11 @@ description: >
   "OO 재무제표 뽑아줘", "다트에서 OO 재무제표 가져와줘", "OO DART 재무제표 자동화 실행",
   "OO 최근 12분기 재무제표", "OO 최근 5개년 사업보고서 재무제표 정리해줘", or any request
   to build a quarterly/annual financial statement Excel file for a KOSPI-listed company
-  using the DART Open API.
+  using the DART Open API. Also use when the user asks to compare multiple companies'
+  financials side by side in one file, such as "삼성전자, LG화학, 카카오 비교" or
+  "OO랑 OO 재무제표 비교해줘".
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # DART 재무제표 추출 및 엑셀 생성
@@ -31,6 +33,20 @@ metadata:
 | 시장 구분 확인 | KOSPI(코스피, corp_cls='Y')만 허용 | company.json API로 확인, 코스닥/코넥스면 사용자에게 확인 후 진행 여부를 묻는다. |
 
 **API 키 처리:** 대화 시작 시 사용자가 아직 DART_API_KEY를 알려주지 않았다면 먼저 물어본다. 한 번 받으면 같은 대화 안에서는 다시 묻지 않고 이후 모든 스크립트 호출에 재사용한다. 이 방식은 편의를 위해 명령줄 인자로 키를 넘기므로 대화 기록에 키 값이 그대로 남는다는 점을 사용자에게 짧게 안내한다.
+
+## 0-1. 여러 기업을 요청받았을 때 — "나열" vs "비교" 구분
+
+사용자가 기업을 2개 이상 언급하면 요청 문구에 **"비교"**(또는 "비교해줘", "나란히", "vs" 등 명백히 비교 의도인 표현)가 포함되어 있는지로 분기한다.
+
+- **"비교" 표현이 없는 단순 나열** (예: "삼성전자, LG화학, 카카오 재무제표 뽑아줘"): 아래 1~6단계를 **기업마다 독립적으로 반복**해서, 기업별로 별도의 엑셀 파일을 만든다.
+- **"비교" 표현이 있음** (예: "삼성전자, LG화학, 카카오 비교해줘"): 1~4단계(기업 고유번호 조회 + 원자료 수집)는 기업마다 각각 수행해 `cache/`에 데이터를 쌓아두되, 5단계(엑셀 작성)에서는 `scripts/build_workbook.py`가 아니라 **`scripts/build_comparison_workbook.py`를 한 번만** 실행해 비교용 엑셀 파일 1개를 만든다.
+  ```
+  python scripts/build_comparison_workbook.py "<corp_code1>:<기업명1>" "<corp_code2>:<기업명2>" ... [--years 5] [--quarters 12] [--outdir /mnt/user-data/outputs]
+  ```
+  - 파일명은 스크립트가 자동으로 `{기업명1}, {기업명2}, {기업명3} 비교_{YYYYMMDD}.xlsx` 형식으로 만든다 (예: `삼성전자, LG화학, 카카오 비교_20260805.xlsx`).
+  - 회사마다 상장 시기·공시 이력이 달라 보유한 기간(분기/연도)이 서로 다를 수 있다. 이 스크립트는 모든 회사가 요청한 기업들의 "합집합" 기간 축을 함께 쓰도록 자동으로 맞춘다 — 특정 회사가 특정 기간 데이터가 없으면 그 회사의 해당 구간은 그래프에서 값이 끊긴(공백) 상태로 표시되며, 없는 데이터를 0으로 지어내지 않는다.
+  - 산출물 시트 구성: `비교차트_연간`/`비교차트_분기`(지표별 비교 차트, 회사가 계열) + 회사별 상세 시트(`분기_{기업명}`, `연간_{기업명}`, `지표_{기업명}_분기`, `지표_{기업명}_연간`, 숨김 `원본_{기업명}`).
+  - 비교 차트는 지표 하나당 그래프 하나(회사들을 계열로 나란히): 기본 지표 14개(꺾은선) + 비율 6개(막대) = 총 20개 차트 × 2개 granularity(분기/연간).
 
 ## 1. 기업 고유번호(corp_code) 조회
 
