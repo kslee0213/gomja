@@ -1,6 +1,6 @@
 {
   "name": "dart-kospi-financials",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "KOSPI 상장기업의 DART 공시 재무제표를 자동으로 조회하여 최근 12분기 및 최근 5개년 재무제표를 2개 시트 엑셀 파일로 생성합니다.",
   "author": {
     "name": "User"
