@@ -114,15 +114,15 @@ def amount_lookup(data: dict, sj_div: str, account_id: str, field: str = "thstrm
     return None
 
 
-def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str], reports: dict):
-    """모든 원자료를 '원본데이터' 시트에 적재하고, 셀 좌표 인덱스를 반환한다."""
-    ws = wb.create_sheet("원본데이터")
+def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str], reports: dict, sheet_name: str = "원본데이터"):
+    """모든 원자료를 원본 시트에 적재하고, 셀 좌표 인덱스를 반환한다."""
+    ws = wb.create_sheet(sheet_name)
     ws.sheet_state = "hidden"
     ws["A1"] = "이 시트는 DART 원본 응답값을 그대로 담은 참조용 데이터입니다. 직접 수정하지 마세요."
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
     row = 3
-    cell_index = {}  # (sj_div, account_id, period_label, field) -> "'원본데이터'!$X$Y"
+    cell_index = {}  # (sj_div, account_id, period_label, field) -> "'{sheet_name}'!$X$Y"
 
     def dump_period(period_data: dict, label: str):
         nonlocal row
@@ -141,11 +141,11 @@ def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str]
                 ws.cell(row=row, column=2, value=item["account_nm"])
                 amt = item.get("thstrm_amount")
                 ws.cell(row=row, column=3, value=float(str(amt).replace(",", "")) if amt not in (None, "") else None).font = BLUE
-                cell_index[(sj_div, item["account_id"], label, "thstrm_amount")] = f"'원본데이터'!${get_column_letter(3)}${row}"
+                cell_index[(sj_div, item["account_id"], label, "thstrm_amount")] = f"'{sheet_name}'!${get_column_letter(3)}${row}"
                 add_amt = item.get("thstrm_add_amount")
                 if add_amt not in (None, ""):
                     ws.cell(row=row, column=4, value=float(str(add_amt).replace(",", ""))).font = BLUE
-                    cell_index[(sj_div, item["account_id"], label, "thstrm_add_amount")] = f"'원본데이터'!${get_column_letter(4)}${row}"
+                    cell_index[(sj_div, item["account_id"], label, "thstrm_add_amount")] = f"'{sheet_name}'!${get_column_letter(4)}${row}"
                 row += 1
             row += 1
         row += 1
@@ -174,8 +174,8 @@ def style_header(ws, row: int, ncols: int):
         c.alignment = Alignment(horizontal="center")
 
 
-def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: dict):
-    ws = wb.create_sheet("분기_재무제표")
+def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: dict, sheet_name: str = "분기_재무제표"):
+    ws = wb.create_sheet(sheet_name)
     ws["A1"] = "단위: 원 | 음영 셀은 원본데이터 시트 링크 또는 수식으로 자동 계산됩니다."
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
@@ -252,8 +252,8 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
     return account_row_map, account_name_map, period_labels
 
 
-def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict):
-    ws = wb.create_sheet("연간_재무제표")
+def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict, sheet_name: str = "연간_재무제표"):
+    ws = wb.create_sheet(sheet_name)
     ws["A1"] = "단위: 원 | 사업보고서(연결/별도) 기준, 원본데이터 시트 링크"
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
@@ -464,7 +464,10 @@ def build_indicator_sheet(
                 src_row = account_row_map[(sj, aid)]
                 for i in range(n):
                     col = get_column_letter(3 + i)
-                    ws.cell(row=row, column=3 + i, value=f"='{source_sheet_name}'!{col}{src_row}")
+                    ref = f"'{source_sheet_name}'!{col}{src_row}"
+                    # 해당 회사/기간에 실제 데이터가 없어 원본 셀이 비어 있으면 0이 아니라
+                    # NA()를 반환한다 → 차트에서 0으로 떨어지지 않고 구간이 끊겨(gap) 표시됨.
+                    ws.cell(row=row, column=3 + i, value=f'=IF({ref}="",NA(),{ref})')
 
         for i in range(n):
             ws.cell(row=row, column=3 + i).number_format = "#,##0;(#,##0);-"
@@ -491,7 +494,7 @@ def build_indicator_sheet(
         if num and den:
             for i in range(n):
                 col = get_column_letter(3 + i)
-                ws.cell(row=row, column=3 + i, value=f"=IFERROR({col}{num}/{col}{den}*100,\"\")")
+                ws.cell(row=row, column=3 + i, value=f"=IFERROR({col}{num}/{col}{den}*100,NA())")
                 ws.cell(row=row, column=3 + i).number_format = "0.0"
         row += 1
 
