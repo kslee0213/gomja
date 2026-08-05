@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference, Series
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -185,6 +186,9 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
         ws.cell(row=header_row, column=3 + i, value=f"{p['year']}Q{p['q']}")
     style_header(ws, header_row, 2 + len(quarter_plan))
 
+    account_row_map: dict[tuple[str, str], int] = {}
+    account_name_map: dict[tuple[str, str], str] = {}
+
     row = header_row + 1
     for sj_div, sj_name in SJ_ORDER:
         accounts = collect_accounts(
@@ -196,6 +200,8 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
         ws.cell(row=row, column=1, value=sj_name).font = BOLD
         row += 1
         for acc in accounts:
+            account_row_map[(sj_div, acc["account_id"])] = row
+            account_name_map[(sj_div, acc["account_id"])] = acc["account_nm"]
             ws.cell(row=row, column=2, value=acc["account_nm"])
             for i, p in enumerate(quarter_plan):
                 col = 3 + i
@@ -242,6 +248,9 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
         ws.column_dimensions[get_column_letter(3 + i)].width = 15
     ws.freeze_panes = "C4"
 
+    period_labels = [f"{p['year']}Q{p['q']}" for p in quarter_plan]
+    return account_row_map, account_name_map, period_labels
+
 
 def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict):
     ws = wb.create_sheet("연간_재무제표")
@@ -255,6 +264,9 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
         ws.cell(row=header_row, column=3 + i, value=f"{year}(사업보고서)")
     style_header(ws, header_row, 2 + len(year_list))
 
+    account_row_map: dict[tuple[str, str], int] = {}
+    account_name_map: dict[tuple[str, str], str] = {}
+
     row = header_row + 1
     fy_periods = [{"fy": reports.get(y, {}).get("11011")} for y in year_list]
     for sj_div, sj_name in SJ_ORDER:
@@ -264,6 +276,8 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
         ws.cell(row=row, column=1, value=sj_name).font = BOLD
         row += 1
         for acc in accounts:
+            account_row_map[(sj_div, acc["account_id"])] = row
+            account_name_map[(sj_div, acc["account_id"])] = acc["account_nm"]
             ws.cell(row=row, column=2, value=acc["account_nm"])
             for i, year in enumerate(year_list):
                 col = 3 + i
@@ -281,6 +295,276 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
     for i in range(len(year_list)):
         ws.column_dimensions[get_column_letter(3 + i)].width = 18
     ws.freeze_panes = "C4"
+
+    period_labels = [f"{year}(사업보고서)" for year in year_list]
+    return account_row_map, account_name_map, period_labels
+
+
+# ---------------------------------------------------------------------------
+# 지표(추세) 시트 & 차트 시트
+#
+# DART 계정명(account_nm)은 회사마다 표기가 조금씩 다를 수 있어(예: "매출액" vs
+# "수익(매출액)", "기타수익" vs "기타영업외수익") 계정ID 하나로 고정 매칭하지 않고
+# 우선순위가 있는 후보 이름 목록 + 부분일치 폴백으로 탐색한다. 못 찾으면 해당
+# 지표는 빈 칸으로 두고 경고를 출력한다(값을 임의로 지어내지 않음).
+# ---------------------------------------------------------------------------
+
+# key: 내부 식별자, value: (sj_div, [완전일치 후보(우선순위순)], [부분일치 폴백 키워드], [제외 키워드])
+METRIC_RULES: dict[str, tuple[str, list[str], list[str], list[str]]] = {
+    "매출액": ("IS", ["매출액", "수익(매출액)", "영업수익"], ["매출액"], ["매출원가", "율"]),
+    "매출원가": ("IS", ["매출원가"], ["매출원가"], ["율"]),
+    "영업이익": ("IS", ["영업이익", "영업이익(손실)"], ["영업이익"], ["율", "률"]),
+    "당기순이익": (
+        "IS",
+        ["당기순이익", "당기순이익(손실)", "분기순이익(손실)", "반기순이익(손실)", "분기순이익", "반기순이익"],
+        ["순이익"],
+        ["지배", "비지배", "주당"],
+    ),
+    "유동자산": ("BS", ["유동자산"], ["유동자산"], ["비유동"]),
+    "유동부채": ("BS", ["유동부채"], ["유동부채"], ["비유동"]),
+    "자산총계": ("BS", ["자산총계"], ["자산총계"], []),
+    "부채총계": ("BS", ["부채총계"], ["부채총계"], []),
+    "자본총계": ("BS", ["자본총계"], ["자본총계"], []),
+    "매출채권및기타채권": (
+        "BS",
+        ["매출채권및기타채권", "매출채권및기타유동채권", "매출채권"],
+        ["매출채권"],
+        ["비유동"],
+    ),
+    "이익잉여금": ("BS", ["이익잉여금", "이익잉여금(결손금)"], ["이익잉여금"], []),
+    "현금및현금성자산의증가": (
+        "CF",
+        ["현금및현금성자산의순증가(감소)", "현금및현금성자산의 증가(감소)", "현금및현금성자산의증가(감소)"],
+        ["현금및현금성자산의"],
+        ["기초", "기말", "환율"],
+    ),
+    "금융수익": ("IS", ["금융수익"], ["금융수익"], []),
+    "금융비용": ("IS", ["금융비용"], ["금융비용"], []),
+    "기타수익": ("IS", ["기타수익", "기타영업외수익"], ["기타수익", "기타영업외수익"], []),
+    "기타비용": ("IS", ["기타비용", "기타영업외비용"], ["기타비용", "기타영업외비용"], []),
+}
+
+
+def resolve_metric(
+    key: str, account_row_map: dict, account_name_map: dict
+) -> tuple[str, str] | None:
+    """METRIC_RULES에 따라 (sj_div, account_id)를 찾아 반환한다. 못 찾으면 None."""
+    sj_div, exact_candidates, substr_keywords, excludes = METRIC_RULES[key]
+    same_sj = [
+        (sj, aid) for (sj, aid) in account_row_map if sj == sj_div
+    ]
+
+    def excluded(name: str) -> bool:
+        return any(ex in name for ex in excludes)
+
+    # 1차: 완전일치 (우선순위 순서대로)
+    for cand in exact_candidates:
+        for sj, aid in same_sj:
+            name = account_name_map[(sj, aid)]
+            if name == cand and not excluded(name):
+                return sj, aid
+
+    # 2차: 부분일치
+    for kw in substr_keywords:
+        for sj, aid in same_sj:
+            name = account_name_map[(sj, aid)]
+            if kw in name and not excluded(name):
+                return sj, aid
+
+    return None
+
+
+# 지표 시트에 표시할 행 순서와 표시 이름 (라인차트 5개가 참조하는 "기본" 지표들)
+INDICATOR_ROWS = [
+    "매출액",
+    "매출원가",
+    "매출총이익",
+    "영업이익",
+    "당기순이익",
+    "경상이익",
+    "유동자산",
+    "매출채권및기타채권",
+    "유동부채",
+    "자산총계",
+    "부채총계",
+    "자본총계",
+    "이익잉여금",
+    "현금및현금성자산의증가",
+]
+
+RATIO_ROWS = ["자기자본비율", "부채비율", "매출총이익률", "원가율", "영업이익률", "순이익률"]
+
+# 그래프1~5 구성 (지표 시트의 행 이름 기준)
+LINE_CHART_GROUPS = [
+    ("그래프1_매출액-매출원가-매출총이익", ["매출액", "매출원가", "매출총이익"]),
+    ("그래프2_이익지표(매출총이익-영업이익-순이익-경상이익)", ["매출총이익", "영업이익", "당기순이익", "경상이익"]),
+    ("그래프3_유동자산-유동부채-자산-부채", ["유동자산", "유동부채", "자산총계", "부채총계"]),
+    ("그래프4_매출액-매출채권", ["매출액", "매출채권및기타채권"]),
+    ("그래프5_이익잉여금-현금증가", ["이익잉여금", "현금및현금성자산의증가"]),
+]
+
+
+def build_indicator_sheet(
+    wb: Workbook,
+    prefix: str,
+    source_sheet_name: str,
+    period_labels: list[str],
+    account_row_map: dict,
+    account_name_map: dict,
+) -> tuple[str, dict[str, int], list[str]]:
+    """소스 시트(분기_재무제표/연간_재무제표)를 참조하는 '지표_{prefix}' 시트를 만든다.
+    반환: (시트이름, {행이름: 행번호}, 못찾은 지표 목록)"""
+    sheet_name = f"지표_{prefix}"
+    ws = wb.create_sheet(sheet_name)
+    n = len(period_labels)
+
+    ws.cell(row=1, column=1, value="지표").font = BOLD
+    for i, label in enumerate(period_labels):
+        ws.cell(row=1, column=3 + i, value=label)
+    style_header(ws, 1, 2 + n)
+
+    resolved: dict[str, tuple[str, str] | None] = {
+        key: resolve_metric(key, account_row_map, account_name_map)
+        for key in METRIC_RULES
+    }
+    missing = [key for key, v in resolved.items() if v is None]
+
+    row_of: dict[str, int] = {}
+    row = 2
+    for name in INDICATOR_ROWS:
+        ws.cell(row=row, column=2, value=name)
+        row_of[name] = row
+
+        if name == "매출총이익":
+            if row_of.get("매출액") and row_of.get("매출원가"):
+                a, b = row_of["매출액"], row_of["매출원가"]
+                for i in range(n):
+                    col = get_column_letter(3 + i)
+                    ws.cell(row=row, column=3 + i, value=f"={col}{a}-{col}{b}")
+        elif name == "경상이익":
+            if row_of.get("영업이익"):
+                op_row = row_of["영업이익"]
+                fin_terms = []  # (부호, sj_div, account_id)
+                for key, sign in (("금융수익", "+"), ("금융비용", "-"), ("기타수익", "+"), ("기타비용", "-")):
+                    hit = resolved.get(key)
+                    if hit:
+                        fin_terms.append((sign, hit))
+                for i in range(n):
+                    col = get_column_letter(3 + i)
+                    src_col = get_column_letter(3 + i)
+                    parts = [f"{src_col}{op_row}"]
+                    for sign, (sj, aid) in fin_terms:
+                        r = account_row_map[(sj, aid)]
+                        parts.append(f"{sign}'{source_sheet_name}'!{src_col}{r}")
+                    ws.cell(row=row, column=3 + i, value="=" + "".join(parts))
+        else:
+            hit = resolved.get(name)
+            if hit:
+                sj, aid = hit
+                src_row = account_row_map[(sj, aid)]
+                for i in range(n):
+                    col = get_column_letter(3 + i)
+                    ws.cell(row=row, column=3 + i, value=f"='{source_sheet_name}'!{col}{src_row}")
+
+        for i in range(n):
+            ws.cell(row=row, column=3 + i).number_format = "#,##0;(#,##0);-"
+        row += 1
+
+    row += 1  # 구분 여백
+    for name in RATIO_ROWS:
+        ws.cell(row=row, column=2, value=name)
+        row_of[name] = row
+        if name == "자기자본비율" and row_of.get("자본총계") and row_of.get("자산총계"):
+            num, den = row_of["자본총계"], row_of["자산총계"]
+        elif name == "부채비율" and row_of.get("부채총계") and row_of.get("자본총계"):
+            num, den = row_of["부채총계"], row_of["자본총계"]
+        elif name == "매출총이익률" and row_of.get("매출총이익") and row_of.get("매출액"):
+            num, den = row_of["매출총이익"], row_of["매출액"]
+        elif name == "원가율" and row_of.get("매출원가") and row_of.get("매출액"):
+            num, den = row_of["매출원가"], row_of["매출액"]
+        elif name == "영업이익률" and row_of.get("영업이익") and row_of.get("매출액"):
+            num, den = row_of["영업이익"], row_of["매출액"]
+        elif name == "순이익률" and row_of.get("당기순이익") and row_of.get("매출액"):
+            num, den = row_of["당기순이익"], row_of["매출액"]
+        else:
+            num, den = None, None
+        if num and den:
+            for i in range(n):
+                col = get_column_letter(3 + i)
+                ws.cell(row=row, column=3 + i, value=f"=IFERROR({col}{num}/{col}{den}*100,\"\")")
+                ws.cell(row=row, column=3 + i).number_format = "0.0"
+        row += 1
+
+    if missing:
+        ws.cell(row=row + 1, column=1, value="※ 아래 지표는 이 회사 공시에서 계정명을 찾지 못해 비어 있습니다:").font = Font(
+            name=FONT_NAME, italic=True, size=9, color="C00000"
+        )
+        ws.cell(row=row + 2, column=1, value=", ".join(missing)).font = Font(
+            name=FONT_NAME, italic=True, size=9, color="C00000"
+        )
+
+    ws.column_dimensions["A"].width = 4
+    ws.column_dimensions["B"].width = 26
+    for i in range(n):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 15
+    ws.freeze_panes = "C2"
+
+    return sheet_name, row_of, missing
+
+
+def _add_line_series(chart: LineChart, ws, row_of: dict, names: list[str], n_periods: int):
+    for name in names:
+        r = row_of.get(name)
+        if not r:
+            continue
+        data_ref = Reference(ws, min_col=3, max_col=2 + n_periods, min_row=r, max_row=r)
+        series = Series(data_ref, title=name)
+        series.smooth = False
+        chart.series.append(series)
+
+
+def build_chart_sheet(
+    wb: Workbook, prefix: str, indicator_sheet_name: str, row_of: dict, n_periods: int
+):
+    ws = wb.create_sheet(f"차트_{prefix}")
+    ind_ws = wb[indicator_sheet_name]
+    cat_ref = Reference(ind_ws, min_col=3, max_col=2 + n_periods, min_row=1, max_row=1)
+
+    anchor_row = 1
+    for title, names in LINE_CHART_GROUPS:
+        chart = LineChart()
+        chart.title = title
+        chart.style = 2
+        chart.y_axis.title = "금액(원)"
+        chart.x_axis.title = "기간"
+        chart.height = 9
+        chart.width = 22
+        _add_line_series(chart, ind_ws, row_of, names, n_periods)
+        chart.set_categories(cat_ref)
+        ws.add_chart(chart, f"A{anchor_row}")
+        anchor_row += 19
+
+    # 비율 막대그래프 (계열 6개)
+    bar = BarChart()
+    bar.type = "col"
+    bar.grouping = "clustered"
+    bar.title = "그래프6_수익성-안정성 비율(%)"
+    bar.style = 10
+    bar.y_axis.title = "%"
+    bar.x_axis.title = "기간"
+    bar.height = 9
+    bar.width = 22
+    for name in RATIO_ROWS:
+        r = row_of.get(name)
+        if not r:
+            continue
+        data_ref = Reference(ind_ws, min_col=3, max_col=2 + n_periods, min_row=r, max_row=r)
+        series = Series(data_ref, title=name)
+        bar.series.append(series)
+    bar.set_categories(cat_ref)
+    ws.add_chart(bar, f"A{anchor_row}")
+
+    ws.sheet_view.showGridLines = False
 
 
 def main() -> None:
@@ -317,19 +601,48 @@ def main() -> None:
     wb.remove(wb.active)
 
     cell_index = write_raw_sheet(wb, quarter_plan, year_list, reports)
-    build_quarterly_sheet(wb, quarter_plan, cell_index)
-    build_annual_sheet(wb, year_list, reports, cell_index)
+    q_row_map, q_name_map, q_labels = build_quarterly_sheet(wb, quarter_plan, cell_index)
+    y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
 
-    # 시트 순서: 분기_재무제표 -> 연간_재무제표 -> 원본데이터(숨김) 순으로 고정
-    desired_order = ["분기_재무제표", "연간_재무제표", "원본데이터"]
-    wb._sheets = [wb[name] for name in desired_order]
+    all_missing: dict[str, list[str]] = {}
+    if quarter_plan:
+        q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
+            wb, "분기", "분기_재무제표", q_labels, q_row_map, q_name_map
+        )
+        build_chart_sheet(wb, "분기", q_ind_sheet, q_row_of, len(q_labels))
+        if q_missing:
+            all_missing["분기"] = q_missing
+    if year_list:
+        y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
+            wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
+        )
+        build_chart_sheet(wb, "연간", y_ind_sheet, y_row_of, len(y_labels))
+        if y_missing:
+            all_missing["연간"] = y_missing
+
+    # 시트 순서 고정
+    desired_order = [
+        "분기_재무제표", "연간_재무제표",
+        "지표_분기", "차트_분기",
+        "지표_연간", "차트_연간",
+        "원본데이터",
+    ]
+    wb._sheets = [wb[name] for name in desired_order if name in wb.sheetnames]
 
     today = dt.date.today().strftime("%Y%m%d")
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     outfile = outdir / f"{args.company_name}_{today}.xlsx"
     wb.save(outfile)
-    print(json.dumps({"saved": str(outfile), "quarters_filled": len(quarter_plan), "years_filled": len(year_list)}, ensure_ascii=False))
+    print(json.dumps(
+        {
+            "saved": str(outfile),
+            "quarters_filled": len(quarter_plan),
+            "years_filled": len(year_list),
+            "missing_indicators": all_missing,
+        },
+        ensure_ascii=False,
+    ))
 
 
 if __name__ == "__main__":
