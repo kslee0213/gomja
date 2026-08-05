@@ -2,10 +2,12 @@
 DART corpCode.xml을 다운로드/캐시하고 기업명으로 corp_code를 조회한다.
 
 사용법:
-    python corp_code_lookup.py "삼성전자"
+    python corp_code_lookup.py --api-key <키> "삼성전자"
 
-환경 변수:
-    DART_API_KEY  필수. DART Open API 인증키.
+API 키:
+    --api-key 인자로 전달하는 것을 우선한다 (Cowork 등 OS 환경 변수가
+    전달되지 않는 격리 환경에서도 동작). --api-key가 없으면 환경 변수
+    DART_API_KEY를 폴백으로 사용한다.
 
 동작:
     1. cache/CORPCODE.xml이 없거나 7일 이상 오래되었으면 재다운로드한다.
@@ -35,12 +37,12 @@ CORP_CODE_XML = CACHE_DIR / "CORPCODE.xml"
 CACHE_MAX_AGE_SEC = 7 * 24 * 3600
 
 
-def get_api_key() -> str:
-    key = os.environ.get("DART_API_KEY")
+def get_api_key(cli_key: str | None) -> str:
+    key = cli_key or os.environ.get("DART_API_KEY")
     if not key:
         print(
-            "ERROR: 환경 변수 DART_API_KEY가 설정되어 있지 않습니다. "
-            "Cowork 환경 변수에 DART_API_KEY를 등록한 뒤 다시 실행하세요.",
+            "ERROR: API 키가 없습니다. --api-key 인자로 전달하거나 "
+            "환경 변수 DART_API_KEY를 설정하세요.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -111,12 +113,22 @@ def check_market(api_key: str, corp_code: str) -> str | None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("사용법: python corp_code_lookup.py <기업명>", file=sys.stderr)
+    args = sys.argv[1:]
+    cli_key = None
+    if "--api-key" in args:
+        idx = args.index("--api-key")
+        if idx + 1 >= len(args):
+            print("ERROR: --api-key 다음에 키 값이 필요합니다.", file=sys.stderr)
+            sys.exit(1)
+        cli_key = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    if len(args) < 1:
+        print("사용법: python corp_code_lookup.py --api-key <키> <기업명>", file=sys.stderr)
         sys.exit(1)
 
-    company_name = sys.argv[1]
-    api_key = get_api_key()
+    company_name = args[0]
+    api_key = get_api_key(cli_key)
 
     refresh_corp_code_cache(api_key)
     corps = load_corp_list()
