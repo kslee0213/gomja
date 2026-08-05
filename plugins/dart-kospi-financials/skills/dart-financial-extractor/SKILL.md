@@ -8,7 +8,7 @@ description: >
   to build a quarterly/annual financial statement Excel file for a KOSPI-listed company
   using the DART Open API.
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # DART 재무제표 추출 및 엑셀 생성
@@ -21,7 +21,7 @@ metadata:
 
 | 설정 항목 | 기본값 | 설명 |
 |---|---|---|
-| `DART_API_KEY` | (환경 변수) | `os.environ["DART_API_KEY"]`로 읽는다. 없으면 실행 전에 사용자에게 요청하고, 응답에도 파일에도 값 자체를 노출하지 않는다. |
+| `DART_API_KEY` | (사용자 제공) | Cowork는 격리된 환경에서 실행되어 OS 환경 변수를 상속받지 못하므로, 스킬 시작 시 대화 맥락에 값이 없으면 사용자에게 직접 요청한다. 받은 값은 매번 `scripts/corp_code_lookup.py`와 `scripts/fetch_financials.py`를 실행할 때 `--api-key <값>` 인자로 전달한다. 값 자체를 요약, 로그, 캐시 파일, 최종 산출물(엑셀) 어디에도 노출하지 않는다. |
 | `FS_DIV` | `CFS` (연결재무제표) | 응답의 `list`가 비어 있으면 `OFS`(별도재무제표)로 자동 재시도한다. 어떤 구분을 썼는지 최종 산출물에 표기한다. |
 | `분기 수` | 12 | 최근 N개 분기. |
 | `연도 수` | 5 | 최근 N개 사업연도. |
@@ -30,11 +30,13 @@ metadata:
 | 파일명 규칙 | `{기업명}_{YYYYMMDD}.xlsx` | YYYYMMDD는 실행 당일(로컬 날짜). |
 | 시장 구분 확인 | KOSPI(코스피, corp_cls='Y')만 허용 | company.json API로 확인, 코스닥/코넥스면 사용자에게 확인 후 진행 여부를 묻는다. |
 
+**API 키 처리:** 대화 시작 시 사용자가 아직 DART_API_KEY를 알려주지 않았다면 먼저 물어본다. 한 번 받으면 같은 대화 안에서는 다시 묻지 않고 이후 모든 스크립트 호출에 재사용한다. 이 방식은 편의를 위해 명령줄 인자로 키를 넘기므로 대화 기록에 키 값이 그대로 남는다는 점을 사용자에게 짧게 안내한다.
+
 ## 1. 기업 고유번호(corp_code) 조회
 
 DART API는 기업명이 아니라 8자리 `corp_code`로 조회한다.
 
-1. `scripts/corp_code_lookup.py`를 실행해 `corpCode.xml`(캐시가 7일 이상 오래됐으면 `https://opendart.fss.or.kr/api/corpCode.xml`에서 재다운로드, ZIP)에서 기업명을 매칭한다.
+1. `scripts/corp_code_lookup.py --api-key <DART_API_KEY> "<기업명>"`을 실행해 `corpCode.xml`(캐시가 7일 이상 오래됐으면 `https://opendart.fss.or.kr/api/corpCode.xml`에서 재다운로드, ZIP)에서 기업명을 매칭한다.
 2. 동일한 이름이 여러 개면(자회사, 유사 상호 등) 후보 목록을 사용자에게 보여주고 선택받는다.
 3. `company.json` API(`https://opendart.fss.or.kr/api/company.json`)로 `corp_cls`(법인구분: Y=코스피, K=코스닥, N=코넥스, E=기타)를 확인한다. Y가 아니면 사용자에게 알리고 계속할지 확인한다.
 
@@ -50,7 +52,7 @@ DART API는 기업명이 아니라 8자리 `corp_code`로 조회한다.
 
 ## 3. 재무제표 원자료 조회
 
-`scripts/fetch_financials.py`로 각 (연도, reprt_code) 조합마다 `fnlttSinglAcntAll.json`을 호출한다.
+`scripts/fetch_financials.py --api-key <DART_API_KEY> <corp_code> <연도> <보고서코드> [fs_div]`로 각 (연도, reprt_code) 조합마다 `fnlttSinglAcntAll.json`을 호출한다.
 
 ```
 GET https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json
@@ -92,11 +94,27 @@ GET https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json
 - 각 시트 상단에 `fs_div`(연결/별도), 데이터 출처(DART corp_code, 접수번호 `rcept_no`), 생성일을 메모로 남긴다.
 - 작성 후 `python scripts/office/recalc.py output.xlsx` (xlsx 스킬 경로 기준)를 실행해 수식 오류가 없는지 검증한다.
 
+## 5-1. 추세 지표 및 그래프 (자동 생성)
+
+`build_workbook.py`는 위 2개 시트에 더해 **지표_분기 / 차트_분기 / 지표_연간 / 차트_연간** 4개 시트를 함께 만든다. 별도 실행 스크립트는 없고 `build_workbook.py` 실행 한 번으로 전부 생성된다.
+
+- **지표\_{분기|연간}**: `분기_재무제표`/`연간_재무제표` 셀을 참조하는 수식으로 아래 지표를 계산한다(하드코딩 없음).
+  - 기본 지표: 매출액, 매출원가, 매출총이익(=매출액−매출원가), 영업이익, 당기순이익, 경상이익(=영업이익+금융수익−금융비용+기타수익−기타비용), 유동자산, 매출채권및기타채권, 유동부채, 자산총계, 부채총계, 자본총계, 이익잉여금, 현금및현금성자산의증가(현금흐름표의 순증가 항목)
+  - 비율 지표(%): 자기자본비율(자본총계/자산총계), 부채비율(부채총계/자본총계), 매출총이익률, 원가율, 영업이익률, 순이익률 (모두 매출액 대비)
+- **차트\_{분기|연간}**: 지표 시트를 참조하는 openpyxl 차트 6개.
+  - 그래프1(꺾은선): 매출액·매출원가·매출총이익
+  - 그래프2(꺾은선): 매출총이익·영업이익·당기순이익·경상이익
+  - 그래프3(꺾은선): 유동자산·유동부채·자산총계·부채총계
+  - 그래프4(꺾은선): 매출액·매출채권및기타채권
+  - 그래프5(꺾은선): 이익잉여금·현금및현금성자산의증가
+  - 그래프6(막대, 계열 6개): 자기자본비율·부채비율·매출총이익률·원가율·영업이익률·순이익률
+- **계정명 매칭 한계**: 위 지표들은 회사마다 표기가 다를 수 있는 `account_nm`을 우선순위 후보 목록으로 탐색해 매칭한다(예: "기타수익" 또는 "기타영업외수익"). 특정 회사에서 매칭에 실패한 지표는 지표 시트에 빈 칸으로 남고, 시트 하단에 어떤 지표를 못 찾았는지 빨간 글씨로 표시된다. 이 경우 원인은 값을 지어내지 않고 사용자에게 "이 지표는 이 회사 공시에서 찾지 못했습니다"라고 그대로 안내한다.
+
 ## 6. 저장 및 전달
 
 - 파일명: `{기업명}_{YYYYMMDD}.xlsx` (예: `삼성전자_20260804.xlsx`)
 - Cowork의 출력 폴더에 저장하고 사용자에게 전달한다.
-- 완료 후 요약: 어떤 fs_div(연결/별도)를 사용했는지, 12분기 중 실제로 채워진 분기 수(공시 지연으로 못 채운 경우 몇 분기가 비었는지), 사용한 corp_code를 간단히 알려준다.
+- 완료 후 요약: 어떤 fs_div(연결/별도)를 사용했는지, 12분기 중 실제로 채워진 분기 수(공시 지연으로 못 채운 경우 몇 분기가 비었는지), 사용한 corp_code, 그리고 매칭에 실패해 빈 칸으로 남은 지표가 있으면 그 목록(`build_workbook.py`의 표준출력 JSON `missing_indicators` 필드)을 간단히 알려준다.
 
 ## 오류 처리
 
