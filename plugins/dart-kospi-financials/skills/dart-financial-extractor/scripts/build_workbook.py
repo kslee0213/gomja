@@ -174,8 +174,10 @@ def style_header(ws, row: int, ncols: int):
         c.alignment = Alignment(horizontal="center")
 
 
-def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: dict, sheet_name: str = "분기_재무제표"):
+def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: dict, sheet_name: str = "분기_재무제표", hidden: bool = False):
     ws = wb.create_sheet(sheet_name)
+    if hidden:
+        ws.sheet_state = "hidden"
     ws["A1"] = "단위: 원 | 음영 셀은 원본데이터 시트 링크 또는 수식으로 자동 계산됩니다."
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
@@ -252,8 +254,10 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
     return account_row_map, account_name_map, period_labels
 
 
-def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict, sheet_name: str = "연간_재무제표"):
+def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict, sheet_name: str = "연간_재무제표", hidden: bool = False):
     ws = wb.create_sheet(sheet_name)
+    if hidden:
+        ws.sheet_state = "hidden"
     ws["A1"] = "단위: 원 | 사업보고서(연결/별도) 기준, 원본데이터 시트 링크"
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
@@ -342,6 +346,33 @@ METRIC_RULES: dict[str, tuple[str, list[str], list[str], list[str]]] = {
     "금융비용": ("IS", ["금융비용"], ["금융비용"], []),
     "기타수익": ("IS", ["기타수익", "기타영업외수익"], ["기타수익", "기타영업외수익"], []),
     "기타비용": ("IS", ["기타비용", "기타영업외비용"], ["기타비용", "기타영업외비용"], []),
+
+    # --- 아래는 "투자분석" 시트 전용 추가 지표 (기존 단일기업 지표/차트에는 영향 없음) ---
+    "재고자산": ("BS", ["재고자산"], ["재고자산"], []),
+    "비유동자산": ("BS", ["비유동자산"], ["비유동자산"], []),
+    "법인세차감전순이익": (
+        "IS",
+        ["법인세비용차감전순이익(손실)", "법인세비용차감전순이익", "법인세차감전순이익"],
+        ["법인세비용차감전", "법인세차감전"],
+        [],
+    ),
+    "영업활동현금흐름": (
+        "CF",
+        ["영업활동으로인한현금흐름", "영업활동현금흐름"],
+        ["영업활동"],
+        ["투자활동", "재무활동"],
+    ),
+    "현금및현금성자산_기말": ("BS", ["현금및현금성자산"], ["현금및현금성자산"], []),
+    "유가증권": (
+        "BS",
+        ["단기금융상품", "단기투자자산", "유가증권"],
+        ["단기금융상품", "단기투자자산", "유가증권"],
+        ["장기"],
+    ),
+    "투자자산": ("BS", ["투자자산", "장기투자자산", "기타비유동금융자산"], ["투자자산"], []),
+    "유형자산": ("BS", ["유형자산"], ["유형자산"], []),
+    "무형자산": ("BS", ["무형자산"], ["무형자산"], []),
+    "기타유동자산": ("BS", ["기타유동자산"], ["기타유동자산"], []),
 }
 
 
@@ -411,11 +442,16 @@ def build_indicator_sheet(
     period_labels: list[str],
     account_row_map: dict,
     account_name_map: dict,
+    sheet_name: str | None = None,
+    hidden: bool = False,
 ) -> tuple[str, dict[str, int], list[str]]:
-    """소스 시트(분기_재무제표/연간_재무제표)를 참조하는 '지표_{prefix}' 시트를 만든다.
+    """소스 시트(분기_재무제표/연간_재무제표)를 참조하는 지표 시트를 만든다.
     반환: (시트이름, {행이름: 행번호}, 못찾은 지표 목록)"""
-    sheet_name = f"지표_{prefix}"
+    if sheet_name is None:
+        sheet_name = f"지표_{prefix}"
     ws = wb.create_sheet(sheet_name)
+    if hidden:
+        ws.sheet_state = "hidden"
     n = len(period_labels)
 
     ws.cell(row=1, column=1, value="지표").font = BOLD
@@ -423,9 +459,13 @@ def build_indicator_sheet(
         ws.cell(row=1, column=3 + i, value=label)
     style_header(ws, 1, 2 + n)
 
+    # 이 시트가 실제로 쓰는 항목만 확인한다 (투자분석 전용으로 추가된 항목은
+    # 여기서 아예 쓰이지 않으므로 missing 목록에 잘못 섞이면 안 된다).
+    relevant_keys = (set(INDICATOR_ROWS) - {"매출총이익", "경상이익"}) | {"금융수익", "금융비용", "기타수익", "기타비용"}
+    relevant_keys &= set(METRIC_RULES)
     resolved: dict[str, tuple[str, str] | None] = {
         key: resolve_metric(key, account_row_map, account_name_map)
-        for key in METRIC_RULES
+        for key in relevant_keys
     }
     missing = [key for key, v in resolved.items() if v is None]
 
@@ -570,6 +610,464 @@ def build_chart_sheet(
     ws.sheet_view.showGridLines = False
 
 
+# ---------------------------------------------------------------------------
+# 투자분석 시트 (v0.4.0) — 첨부 자료("기업 분석 리포트 쓰는 법")의 재무지표/
+# 위험신호/청산가치/주가지표 체크리스트를 자동 계산한다.
+# ---------------------------------------------------------------------------
+
+LABEL = Font(name=FONT_NAME, bold=True)
+NOTE = Font(name=FONT_NAME, italic=True, size=9, color="808080")
+WARN = Font(name=FONT_NAME, color="C00000")
+
+
+def load_company_profile(corp_code: str) -> dict | None:
+    fp = CACHE_DIR / f"company_{corp_code}.json"
+    if not fp.exists():
+        return None
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_extra_disclosures(corp_code: str, year: str, reprt_code: str = "11011") -> dict | None:
+    fp = CACHE_DIR / f"extra_{corp_code}_{year}_{reprt_code}.json"
+    if not fp.exists():
+        return None
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_price(stock_code: str, yyyymmdd: str) -> dict | None:
+    fp = CACHE_DIR / f"price_{stock_code}_{yyyymmdd}.json"
+    if not fp.exists():
+        return None
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _fmt_num(v):
+    try:
+        return float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_investment_analysis_sheet(
+    wb: Workbook,
+    company_name: str,
+    corp_code: str,
+    y_period_labels: list[str],
+    year_list: list[str],
+    y_account_row_map: dict,
+    y_account_name_map: dict,
+    y_ind_sheet: str,
+    y_row_of: dict,
+) -> list[str]:
+    """'투자분석' 시트를 만든다. 반환값: 이번에 못 찾은/못 가져온 항목 경고 목록."""
+    ws = wb.create_sheet("투자분석")
+    n = len(y_period_labels)
+    warnings: list[str] = []
+    profile = load_company_profile(corp_code)
+    stock_code = (profile or {}).get("stock_code", "").strip() or None
+
+    def resolve(key: str):
+        hit = resolve_metric(key, y_account_row_map, y_account_name_map)
+        if hit is None:
+            warnings.append(key)
+        return hit
+
+    def year_ref(hit, i: int) -> str:
+        if not hit:
+            return ""
+        sj, aid = hit
+        src_row = y_account_row_map[(sj, aid)]
+        col = get_column_letter(3 + i)
+        return f"'연간_재무제표'!{col}{src_row}"
+
+    def ind_ref(name: str, i: int) -> str:
+        r = y_row_of.get(name)
+        if not r:
+            return ""
+        col = get_column_letter(3 + i)
+        return f"'{y_ind_sheet}'!{col}{r}"
+
+    row = 1
+    ws.cell(row=row, column=1, value=f"투자분석 — {company_name}").font = Font(name=FONT_NAME, bold=True, size=14)
+    row += 2
+
+    # --- A. 회사 개황 ---
+    ws.cell(row=row, column=1, value="A. 회사 개황").font = LABEL
+    row += 1
+    fields = [
+        ("기업명", "corp_name"), ("종목코드", "stock_code"), ("대표자", "ceo_nm"),
+        ("설립일", "est_dt"), ("업종코드", "induty_code"), ("주소", "adres"),
+        ("홈페이지", "hm_url"),
+    ]
+    for label, key in fields:
+        ws.cell(row=row, column=1, value=label)
+        val = profile.get(key) if profile else None
+        ws.cell(row=row, column=2, value=val if val else "(정보 없음)")
+        row += 1
+    if not profile:
+        ws.cell(row=row, column=1, value="※ company.json 캐시가 없습니다. corp_code_lookup.py를 먼저 실행하세요.").font = NOTE
+        row += 1
+    row += 1
+
+    # --- B. 신규 기초 항목 (기존 지표_연간에 없는 것만 이 시트에 새로 마련) ---
+    base_start_row = row
+    extra_base_names = ["재고자산", "비유동자산", "법인세차감전순이익", "영업활동현금흐름"]
+    extra_row: dict[str, int] = {}
+    for name in extra_base_names:
+        hit = resolve(name)
+        ws.cell(row=row, column=1, value=name).font = NOTE
+        extra_row[name] = row
+        for i in range(n):
+            ref = year_ref(hit, i)
+            c = ws.cell(row=row, column=3 + i)
+            if ref:
+                c.value = f"={ref}"
+            c.number_format = "#,##0;(#,##0);-"
+            c.font = NOTE
+        row += 1
+    ws.cell(row=base_start_row - 0, column=1)  # no-op anchor
+    row += 1
+
+    def base_cell(name: str, i: int) -> str:
+        col = get_column_letter(3 + i)
+        return f"{col}{extra_row[name]}"
+
+    # 청산가치용 추가 기초 항목 (마지막 연도만 쓰지만 전체 연도 계산해 둔다)
+    liq_names = ["현금및현금성자산_기말", "유가증권", "투자자산", "유형자산", "무형자산", "기타유동자산"]
+    for name in liq_names:
+        hit = resolve(name)
+        ws.cell(row=row, column=1, value=name).font = NOTE
+        extra_row[name] = row
+        for i in range(n):
+            ref = year_ref(hit, i)
+            c = ws.cell(row=row, column=3 + i)
+            if ref:
+                c.value = f"={ref}"
+            c.number_format = "#,##0;(#,##0);-"
+            c.font = NOTE
+        row += 1
+    row += 1
+
+    header_row = base_start_row - 1
+    ws.cell(row=header_row, column=1, value="(기초 참고값)").font = NOTE
+    for i, label in enumerate(y_period_labels):
+        ws.cell(row=header_row, column=3 + i, value=label).font = NOTE
+
+    # --- C. 재무비율 ---
+    ws.cell(row=row, column=1, value="B. 재무지표").font = LABEL
+    row += 1
+    ratio_header = row
+    ws.cell(row=row, column=1, value="지표")
+    for i, label in enumerate(y_period_labels):
+        ws.cell(row=row, column=3 + i, value=label)
+    style_header(ws, row, 2 + n)
+    row += 1
+
+    def write_ratio_row(name: str, formula_fn, fmt="0.0"):
+        nonlocal row
+        ws.cell(row=row, column=1, value=name)
+        for i in range(n):
+            f = formula_fn(i)
+            c = ws.cell(row=row, column=3 + i)
+            if f:
+                c.value = f
+            c.number_format = fmt
+        row += 1
+
+    ws.cell(row=row, column=1, value="[건전성]").font = Font(name=FONT_NAME, italic=True)
+    row += 1
+    write_ratio_row("자기자본비율(%)", lambda i: f"={ind_ref('자기자본비율', i)}" if ind_ref('자기자본비율', i) else "")
+    write_ratio_row("부채비율(%)", lambda i: f"={ind_ref('부채비율', i)}" if ind_ref('부채비율', i) else "")
+    write_ratio_row(
+        "유동비율(%)",
+        lambda i: f"=IFERROR({ind_ref('유동자산', i)}/{ind_ref('유동부채', i)}*100,NA())"
+        if ind_ref("유동자산", i) and ind_ref("유동부채", i) else "",
+    )
+    write_ratio_row(
+        "당좌비율(%)",
+        lambda i: f"=IFERROR(({ind_ref('유동자산', i)}-{base_cell('재고자산', i)})/{ind_ref('유동부채', i)}*100,NA())"
+        if ind_ref("유동자산", i) and ind_ref("유동부채", i) else "",
+    )
+    write_ratio_row(
+        "고정비율(%)",
+        lambda i: f"=IFERROR({base_cell('비유동자산', i)}/{ind_ref('자본총계', i)}*100,NA())"
+        if ind_ref("자본총계", i) else "",
+    )
+
+    ws.cell(row=row, column=1, value="[수익성]").font = Font(name=FONT_NAME, italic=True)
+    row += 1
+    write_ratio_row("매출총이익률(%)", lambda i: f"={ind_ref('매출총이익률', i)}" if ind_ref('매출총이익률', i) else "")
+    write_ratio_row("영업이익률(%)", lambda i: f"={ind_ref('영업이익률', i)}" if ind_ref('영업이익률', i) else "")
+    write_ratio_row(
+        "세전순이익률(%)",
+        lambda i: f"=IFERROR({base_cell('법인세차감전순이익', i)}/{ind_ref('매출액', i)}*100,NA())"
+        if ind_ref("매출액", i) else "",
+    )
+    write_ratio_row("순이익률(%)", lambda i: f"={ind_ref('순이익률', i)}" if ind_ref('순이익률', i) else "")
+    write_ratio_row(
+        "ROE(%)",
+        lambda i: f"=IFERROR({ind_ref('당기순이익', i)}/{ind_ref('자본총계', i)}*100,NA())"
+        if ind_ref("당기순이익", i) and ind_ref("자본총계", i) else "",
+    )
+    write_ratio_row(
+        "ROA(%)",
+        lambda i: f"=IFERROR({ind_ref('당기순이익', i)}/{ind_ref('자산총계', i)}*100,NA())"
+        if ind_ref("당기순이익", i) and ind_ref("자산총계", i) else "",
+    )
+
+    ws.cell(row=row, column=1, value="[성장성]").font = Font(name=FONT_NAME, italic=True)
+    row += 1
+
+    def yoy_fn(metric: str):
+        def f(i):
+            if i == 0:
+                return ""
+            cur, prev = ind_ref(metric, i), ind_ref(metric, i - 1)
+            if not cur or not prev:
+                return ""
+            return f"=IFERROR(({cur}-{prev})/{prev}*100,NA())"
+        return f
+
+    write_ratio_row("매출성장률(%, YoY)", yoy_fn("매출액"))
+    write_ratio_row("영업이익성장률(%, YoY)", yoy_fn("영업이익"))
+    write_ratio_row("순이익성장률(%, YoY)", yoy_fn("당기순이익"))
+    write_ratio_row(
+        "총자산회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출액', i)}/{ind_ref('자산총계', i)},NA())"
+        if ind_ref("매출액", i) and ind_ref("자산총계", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "매출채권회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출액', i)}/{ind_ref('매출채권및기타채권', i)},NA())"
+        if ind_ref("매출액", i) and ind_ref("매출채권및기타채권", i) else "",
+        fmt="0.00",
+    )
+    row += 1
+
+    # --- D. 위험 신호 점검 ---
+    ws.cell(row=row, column=1, value="C. 위험 신호 점검").font = LABEL
+    row += 1
+    risk_header = row
+    ws.cell(row=row, column=1, value="점검 항목")
+    for i, label in enumerate(y_period_labels):
+        ws.cell(row=row, column=3 + i, value=label)
+    style_header(ws, row, 2 + n)
+    row += 1
+
+    def write_risk_row(name: str, formula_fn):
+        nonlocal row
+        ws.cell(row=row, column=1, value=name)
+        for i in range(n):
+            f = formula_fn(i)
+            c = ws.cell(row=row, column=3 + i)
+            if f:
+                c.value = f
+        row += 1
+
+    write_risk_row(
+        "유동부채 > 유동자산",
+        lambda i: f"=IF({ind_ref('유동부채', i)}>{ind_ref('유동자산', i)},\"⚠ 위험\",\"양호\")"
+        if ind_ref("유동부채", i) and ind_ref("유동자산", i) else "",
+    )
+    write_risk_row(
+        "차입금 과다 (자기자본비율<20%)",
+        lambda i: f"=IF({ind_ref('자기자본비율', i)}<20,\"⚠ 위험\",\"양호\")" if ind_ref("자기자본비율", i) else "",
+    )
+    write_risk_row(
+        "순자산 마이너스 (채무초과)",
+        lambda i: f"=IF({ind_ref('자본총계', i)}<0,\"⚠ 위험\",\"양호\")" if ind_ref("자본총계", i) else "",
+    )
+
+    def receivable_spike_fn(i):
+        if i == 0:
+            return ""
+        rev_c, rev_p = ind_ref("매출액", i), ind_ref("매출액", i - 1)
+        rec_c, rec_p = ind_ref("매출채권및기타채권", i), ind_ref("매출채권및기타채권", i - 1)
+        if not (rev_c and rev_p and rec_c and rec_p):
+            return ""
+        return (
+            f"=IFERROR(IF((({rec_c}-{rec_p})/{rec_p}*100)-(({rev_c}-{rev_p})/{rev_p}*100)>20,"
+            f"\"⚠ 위험(매출채권 급증)\",\"양호\"),\"\")"
+        )
+
+    write_risk_row("매출채권 급증 (매출 증가율 대비 +20%p 이상)", receivable_spike_fn)
+    write_risk_row(
+        "영업활동현금흐름 마이너스",
+        lambda i: f"=IF({base_cell('영업활동현금흐름', i)}<0,\"⚠ 위험\",\"양호\")",
+    )
+    row += 1
+
+    # --- E. 청산가치 (자산가치주 체크, 최신 연도 기준) ---
+    ws.cell(row=row, column=1, value="D. 청산가치 (자산가치주 체크 · 최신 연도 기준)").font = LABEL
+    row += 1
+    last_i = n - 1
+    haircut_items = [
+        ("현금및현금성자산", "현금및현금성자산_기말", 1.00),
+        ("유가증권", "유가증권", 1.00),
+        ("매출채권및기타채권", None, 0.85),  # 지표_연간에서 참조
+        ("재고자산", "재고자산", 0.50),
+        ("투자자산", "투자자산", 0.50),
+        ("유형자산", "유형자산", 0.50),
+        ("무형자산", "무형자산", 0.00),
+        ("기타유동자산", "기타유동자산", 0.00),
+    ]
+    ws.cell(row=row, column=1, value="항목")
+    ws.cell(row=row, column=2, value="적용비율")
+    ws.cell(row=row, column=3, value="조정가치")
+    style_header(ws, row, 3)
+    row += 1
+    adj_asset_rows = []
+    for label, base_key, pct in haircut_items:
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=2, value=pct).number_format = "0%"
+        if base_key:
+            src = base_cell(base_key, last_i)
+        else:
+            src = ind_ref("매출채권및기타채권", last_i)
+        c = ws.cell(row=row, column=3)
+        if src and pct > 0:
+            c.value = f"={src}*{pct}"
+        elif src:
+            c.value = 0
+        c.number_format = "#,##0"
+        adj_asset_rows.append(row)
+        row += 1
+    sum_row = row
+    ws.cell(row=row, column=1, value="조정자산 합계").font = LABEL
+    ws.cell(row=row, column=3, value=f"=SUM(C{adj_asset_rows[0]}:C{adj_asset_rows[-1]})").number_format = "#,##0"
+    row += 1
+    debt_ref = ind_ref("부채총계", last_i)
+    ws.cell(row=row, column=1, value="총부채(부채총계)").font = LABEL
+    if debt_ref:
+        ws.cell(row=row, column=3, value=f"={debt_ref}").number_format = "#,##0"
+    row += 1
+    liq_row = row
+    ws.cell(row=row, column=1, value="청산가치 (조정자산 − 총부채)").font = LABEL
+    if debt_ref:
+        ws.cell(row=row, column=3, value=f"=C{sum_row}-C{row - 1}").number_format = "#,##0"
+    row += 2
+
+    # --- F. 주가 연동 지표 (KRX 필요) ---
+    ws.cell(row=row, column=1, value="E. 주가 연동 지표 (KRX 종가 기준)").font = LABEL
+    row += 1
+    if not stock_code:
+        ws.cell(row=row, column=1, value="※ 종목코드가 없어 주가 지표를 건너뜁니다.").font = NOTE
+        row += 2
+    else:
+        ph = row
+        headers = ["연도", "기준일(종가)", "종가", "시가총액", "PER", "PBR", "PSR"]
+        for j, h in enumerate(headers):
+            ws.cell(row=ph, column=1 + j, value=h)
+        style_header(ws, ph, len(headers))
+        row += 1
+        any_price = False
+        for i, year in enumerate(year_list):
+            price = load_price(stock_code, f"{year}1231")
+            ws.cell(row=row, column=1, value=y_period_labels[i])
+            if not price:
+                ws.cell(row=row, column=2, value="(가격 데이터 없음 — fetch_stock_price.py 미실행)").font = NOTE
+                row += 1
+                continue
+            any_price = True
+            close = _fmt_num(price.get("close_price"))
+            listed = _fmt_num(price.get("listed_shares"))
+            mktcap = _fmt_num(price.get("market_cap")) or (close * listed if close and listed else None)
+            ws.cell(row=row, column=2, value=price.get("used_date"))
+            if close is not None:
+                ws.cell(row=row, column=3, value=close).number_format = "#,##0"
+            if mktcap is not None:
+                ws.cell(row=row, column=4, value=mktcap).number_format = "#,##0"
+                net_income_ref = ind_ref("당기순이익", i)
+                equity_ref = ind_ref("자본총계", i)
+                revenue_ref = ind_ref("매출액", i)
+                if net_income_ref:
+                    ws.cell(row=row, column=5, value=f"=IFERROR({mktcap}/{net_income_ref},NA())").number_format = "0.0"
+                if equity_ref:
+                    ws.cell(row=row, column=6, value=f"=IFERROR({mktcap}/{equity_ref},NA())").number_format = "0.00"
+                if revenue_ref:
+                    ws.cell(row=row, column=7, value=f"=IFERROR({mktcap}/{revenue_ref},NA())").number_format = "0.00"
+            row += 1
+        if not any_price:
+            ws.cell(row=row, column=1, value=(
+                "※ 이 회사의 가격 캐시가 하나도 없습니다. "
+                "scripts/fetch_stock_price.py --auth-key <KRX 키> "
+                f"{stock_code} <YYYYMMDD> 를 연도별 결산일 기준으로 먼저 실행하세요."
+            )).font = WARN
+            row += 1
+        row += 1
+
+    # --- G. 배당 · 대주주 · 자기주식 (DART 추가 공시) ---
+    ws.cell(row=row, column=1, value="F. 배당 · 대주주 · 자기주식").font = LABEL
+    row += 1
+    latest_year = year_list[-1] if year_list else None
+    extra = load_extra_disclosures(corp_code, latest_year) if latest_year else None
+    if not extra:
+        ws.cell(row=row, column=1, value=(
+            "※ 추가 공시 캐시가 없습니다. scripts/fetch_extra_disclosures.py를 먼저 실행하세요."
+        )).font = WARN
+        row += 1
+    else:
+        div = extra.get("배당", {})
+        div_list = div.get("list", []) if isinstance(div, dict) else []
+        payout = next((x.get("thstrm") for x in div_list if "배당성향" in (x.get("se") or "")), None)
+        dps = next((x.get("thstrm") for x in div_list if "주당" in (x.get("se") or "") and "현금" in (x.get("se") or "")), None)
+        ws.cell(row=row, column=1, value="배당성향(%)")
+        ws.cell(row=row, column=2, value=payout or "(공시 없음)")
+        row += 1
+        ws.cell(row=row, column=1, value="주당 현금배당금")
+        ws.cell(row=row, column=2, value=dps or "(공시 없음)")
+        row += 1
+
+        holders = extra.get("최대주주현황", {})
+        holder_list = holders.get("list", []) if isinstance(holders, dict) else []
+        ws.cell(row=row, column=1, value="대주주 명단 (최신 보고서 기준)").font = Font(name=FONT_NAME, italic=True)
+        row += 1
+        for h in holder_list[:5]:
+            ws.cell(row=row, column=1, value=h.get("nm", ""))
+            ws.cell(row=row, column=2, value=h.get("trmend_posesn_stock_qota_rt", ""))
+            row += 1
+
+        treasury = extra.get("자기주식현황", {})
+        treasury_list = treasury.get("list", []) if isinstance(treasury, dict) else []
+        if treasury_list:
+            ws.cell(row=row, column=1, value="자기주식 변동(최신 보고서)").font = Font(name=FONT_NAME, italic=True)
+            row += 1
+            for t in treasury_list[:3]:
+                ws.cell(row=row, column=1, value=t.get("acqs_mth1", t.get("trmend_rmnd_stkcnt", "")))
+                row += 1
+    row += 1
+
+    # --- H. 투자 판단 (정성 평가 — 사용자가 직접 채우는 템플릿) ---
+    ws.cell(row=row, column=1, value="G. 투자 판단 (A~E로 직접 평가)").font = LABEL
+    row += 1
+    ws.cell(row=row, column=1, value="항목")
+    ws.cell(row=row, column=2, value="평가(A~E)")
+    ws.cell(row=row, column=3, value="근거 메모")
+    style_header(ws, row, 3)
+    row += 1
+    for item in ["자산으로 본 저평가 정도", "수익 창출 능력으로 본 저평가 정도", "재무건전성", "수익성", "성장성", "사업역량", "주주 중시 자세"]:
+        ws.cell(row=row, column=1, value=item)
+        row += 1
+    ws.cell(row=row, column=1, value="※ 위 표는 자동 계산이 아닌 서식입니다. 위 B~F 섹션의 수치를 참고해 직접 평가해 주세요.").font = NOTE
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 16
+    for i in range(max(n, 5)):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 15
+
+    return warnings
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("corp_code")
@@ -623,11 +1121,19 @@ def main() -> None:
         if y_missing:
             all_missing["연간"] = y_missing
 
+        ia_warnings = build_investment_analysis_sheet(
+            wb, args.company_name, args.corp_code, y_labels, year_list,
+            y_row_map, y_name_map, y_ind_sheet, y_row_of,
+        )
+        if ia_warnings:
+            all_missing["투자분석(계정 매칭 실패)"] = ia_warnings
+
     # 시트 순서 고정
     desired_order = [
         "분기_재무제표", "연간_재무제표",
         "지표_분기", "차트_분기",
         "지표_연간", "차트_연간",
+        "투자분석",
         "원본데이터",
     ]
     wb._sheets = [wb[name] for name in desired_order if name in wb.sheetnames]
