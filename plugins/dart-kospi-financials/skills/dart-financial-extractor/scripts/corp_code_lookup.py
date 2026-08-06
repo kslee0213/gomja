@@ -107,6 +107,14 @@ def check_market(api_key: str, corp_code: str) -> str | None:
     )
     resp.raise_for_status()
     data = resp.json()
+    # 회사 개황 전체를 캐시에 남긴다 (투자분석 시트의 "회사 개황" 섹션에서 재사용)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / f"company_{corp_code}.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
     if data.get("status") != "000":
         return None
     return data.get("corp_cls")  # Y=코스피, K=코스닥, N=코넥스, E=기타
