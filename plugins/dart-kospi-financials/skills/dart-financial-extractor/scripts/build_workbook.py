@@ -373,6 +373,41 @@ METRIC_RULES: dict[str, tuple[str, list[str], list[str], list[str]]] = {
     "유형자산": ("BS", ["유형자산"], ["유형자산"], []),
     "무형자산": ("BS", ["무형자산"], ["무형자산"], []),
     "기타유동자산": ("BS", ["기타유동자산"], ["기타유동자산"], []),
+
+    # --- v0.5.0: CCC·FCF·이자보상배율·DuPont·ROIC·외환손익용 추가 항목 ---
+    "매입채무": ("BS", ["매입채무", "매입채무및기타채무", "매입채무및기타유동채무"], ["매입채무"], ["비유동"]),
+    "이자비용": ("IS", ["이자비용", "금융비용"], ["이자비용"], []),
+    "법인세비용": ("IS", ["법인세비용", "법인세비용(수익)"], ["법인세비용"], []),
+    "유형자산의취득": (
+        "CF",
+        ["유형자산의취득", "유형자산의 취득"],
+        ["유형자산의취득", "유형자산취득"],
+        [],
+    ),
+    "투자활동현금흐름": (
+        "CF",
+        ["투자활동으로인한현금흐름", "투자활동현금흐름"],
+        ["투자활동"],
+        [],
+    ),
+    "재무활동현금흐름": (
+        "CF",
+        ["재무활동으로인한현금흐름", "재무활동현금흐름"],
+        ["재무활동"],
+        [],
+    ),
+    "외화환산손익": (
+        "IS",
+        ["외화환산이익", "외화환산손익"],
+        ["외화환산"],
+        [],
+    ),
+    "파생상품손익": (
+        "IS",
+        ["파생상품평가이익", "파생상품거래이익", "파생상품손익"],
+        ["파생상품"],
+        [],
+    ),
 }
 
 
@@ -681,6 +716,10 @@ def build_investment_analysis_sheet(
             warnings.append(key)
         return hit
 
+    def resolve_optional(key: str):
+        # 회사에 따라 애초에 없는 게 정상인 항목(외환손익 등)은 "매칭 실패" 경고에 안 넣는다.
+        return resolve_metric(key, y_account_row_map, y_account_name_map)
+
     def year_ref(hit, i: int) -> str:
         if not hit:
             return ""
@@ -722,10 +761,12 @@ def build_investment_analysis_sheet(
     base_start_row = row
     extra_base_names = ["재고자산", "비유동자산", "법인세차감전순이익", "영업활동현금흐름"]
     extra_row: dict[str, int] = {}
+    extra_hit: dict[str, tuple | None] = {}
     for name in extra_base_names:
         hit = resolve(name)
         ws.cell(row=row, column=1, value=name).font = NOTE
         extra_row[name] = row
+        extra_hit[name] = hit
         for i in range(n):
             ref = year_ref(hit, i)
             c = ws.cell(row=row, column=3 + i)
@@ -747,6 +788,41 @@ def build_investment_analysis_sheet(
         hit = resolve(name)
         ws.cell(row=row, column=1, value=name).font = NOTE
         extra_row[name] = row
+        extra_hit[name] = hit
+        for i in range(n):
+            ref = year_ref(hit, i)
+            c = ws.cell(row=row, column=3 + i)
+            if ref:
+                c.value = f"={ref}"
+            c.number_format = "#,##0;(#,##0);-"
+            c.font = NOTE
+        row += 1
+    row += 1
+
+    # v0.5.0: CCC·FCF·이자보상배율·DuPont·CF구분용 추가 기초 항목
+    extra2_names = [
+        "매입채무", "이자비용", "법인세비용", "유형자산의취득",
+        "투자활동현금흐름", "재무활동현금흐름",
+    ]
+    for name in extra2_names:
+        hit = resolve(name)
+        ws.cell(row=row, column=1, value=name).font = NOTE
+        extra_row[name] = row
+        extra_hit[name] = hit
+        for i in range(n):
+            ref = year_ref(hit, i)
+            c = ws.cell(row=row, column=3 + i)
+            if ref:
+                c.value = f"={ref}"
+            c.number_format = "#,##0;(#,##0);-"
+            c.font = NOTE
+        row += 1
+    # 외환손익 관련은 없는 회사가 많은 게 정상이라 매칭 실패로 취급하지 않는다.
+    for name in ["외화환산손익", "파생상품손익"]:
+        hit = resolve_optional(name)
+        ws.cell(row=row, column=1, value=name).font = NOTE
+        extra_row[name] = row
+        extra_hit[name] = hit
         for i in range(n):
             ref = year_ref(hit, i)
             c = ws.cell(row=row, column=3 + i)
@@ -772,9 +848,12 @@ def build_investment_analysis_sheet(
     style_header(ws, row, 2 + n)
     row += 1
 
+    b_row: dict[str, int] = {}
+
     def write_ratio_row(name: str, formula_fn, fmt="0.0"):
         nonlocal row
         ws.cell(row=row, column=1, value=name)
+        b_row[name] = row
         for i in range(n):
             f = formula_fn(i)
             c = ws.cell(row=row, column=3 + i)
@@ -782,6 +861,11 @@ def build_investment_analysis_sheet(
                 c.value = f
             c.number_format = fmt
         row += 1
+
+    def b_ref(name: str, i: int) -> str:
+        """섹션 B에서 이미 계산해 둔 지표를 같은 시트 안에서 재참조한다."""
+        col = get_column_letter(3 + i)
+        return f"{col}{b_row[name]}"
 
     ws.cell(row=row, column=1, value="[건전성]").font = Font(name=FONT_NAME, italic=True)
     row += 1
@@ -801,6 +885,22 @@ def build_investment_analysis_sheet(
         "고정비율(%)",
         lambda i: f"=IFERROR({base_cell('비유동자산', i)}/{ind_ref('자본총계', i)}*100,NA())"
         if ind_ref("자본총계", i) else "",
+    )
+    write_ratio_row(
+        "고정장기적합율(%)",
+        lambda i: f"=IFERROR({base_cell('비유동자산', i)}/({ind_ref('자본총계', i)}+({ind_ref('부채총계', i)}-{ind_ref('유동부채', i)}))*100,NA())"
+        if ind_ref("자본총계", i) and ind_ref("부채총계", i) and ind_ref("유동부채", i) else "",
+    )
+    write_ratio_row(
+        "순운전자본대총자본비율(%)",
+        lambda i: f"=IFERROR(({ind_ref('유동자산', i)}-{ind_ref('유동부채', i)})/{ind_ref('자산총계', i)}*100,NA())"
+        if ind_ref("유동자산", i) and ind_ref("유동부채", i) and ind_ref("자산총계", i) else "",
+    )
+    write_ratio_row(
+        "이자보상배율(배)",
+        lambda i: f"=IFERROR({ind_ref('영업이익', i)}/{base_cell('이자비용', i)},NA())"
+        if ind_ref("영업이익", i) else "",
+        fmt="0.00",
     )
 
     ws.cell(row=row, column=1, value="[수익성]").font = Font(name=FONT_NAME, italic=True)
@@ -837,9 +937,23 @@ def build_investment_analysis_sheet(
             return f"=IFERROR(({cur}-{prev})/{prev}*100,NA())"
         return f
 
+    def yoy_fn_base(name: str):
+        def f(i):
+            if i == 0:
+                return ""
+            cur, prev = base_cell(name, i), base_cell(name, i - 1)
+            return f"=IFERROR(({cur}-{prev})/{prev}*100,NA())"
+        return f
+
     write_ratio_row("매출성장률(%, YoY)", yoy_fn("매출액"))
     write_ratio_row("영업이익성장률(%, YoY)", yoy_fn("영업이익"))
     write_ratio_row("순이익성장률(%, YoY)", yoy_fn("당기순이익"))
+    write_ratio_row("총자산증가율(%, YoY)", yoy_fn("자산총계"))
+    write_ratio_row("자기자본증가율(%, YoY)", yoy_fn("자본총계"))
+    write_ratio_row("유형자산증가율(%, YoY)", yoy_fn_base("유형자산"))
+
+    ws.cell(row=row, column=1, value="[활동성]").font = Font(name=FONT_NAME, italic=True)
+    row += 1
     write_ratio_row(
         "총자산회전율(회)",
         lambda i: f"=IFERROR({ind_ref('매출액', i)}/{ind_ref('자산총계', i)},NA())"
@@ -850,6 +964,30 @@ def build_investment_analysis_sheet(
         "매출채권회전율(회)",
         lambda i: f"=IFERROR({ind_ref('매출액', i)}/{ind_ref('매출채권및기타채권', i)},NA())"
         if ind_ref("매출액", i) and ind_ref("매출채권및기타채권", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "자기자본회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출액', i)}/{ind_ref('자본총계', i)},NA())"
+        if ind_ref("매출액", i) and ind_ref("자본총계", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "유형자산회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출액', i)}/{base_cell('유형자산', i)},NA())"
+        if ind_ref("매출액", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "재고자산회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출원가', i)}/{base_cell('재고자산', i)},NA())"
+        if ind_ref("매출원가", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "매입채무회전율(회)",
+        lambda i: f"=IFERROR({ind_ref('매출원가', i)}/{base_cell('매입채무', i)},NA())"
+        if ind_ref("매출원가", i) else "",
         fmt="0.00",
     )
     row += 1
@@ -905,6 +1043,11 @@ def build_investment_analysis_sheet(
         "영업활동현금흐름 마이너스",
         lambda i: f"=IF({base_cell('영업활동현금흐름', i)}<0,\"⚠ 위험\",\"양호\")",
     )
+    write_risk_row(
+        "이자보상배율 1 미만 (이자도 못 갚는 수준)",
+        lambda i: f"=IFERROR(IF({ind_ref('영업이익', i)}/{base_cell('이자비용', i)}<1,\"⚠ 위험\",\"양호\"),\"\")"
+        if ind_ref("영업이익", i) else "",
+    )
     row += 1
 
     # --- E. 청산가치 (자산가치주 체크, 최신 연도 기준) ---
@@ -957,8 +1100,171 @@ def build_investment_analysis_sheet(
         ws.cell(row=row, column=3, value=f"=C{sum_row}-C{row - 1}").number_format = "#,##0"
     row += 2
 
+    # --- E. CCC (현금전환주기) ---
+    ws.cell(row=row, column=1, value="E. 현금전환주기 (CCC)").font = LABEL
+    row += 1
+    write_ratio_row(
+        "매출채권회수기간(일)",
+        lambda i: f"=IFERROR(365/{b_ref('매출채권회전율(회)', i)},NA())",
+    )
+    write_ratio_row(
+        "재고자산처리기간(일)",
+        lambda i: f"=IFERROR(365/{b_ref('재고자산회전율(회)', i)},NA())",
+    )
+    write_ratio_row(
+        "매입채무지불기간(일)",
+        lambda i: f"=IFERROR(365/{b_ref('매입채무회전율(회)', i)},NA())",
+    )
+    write_ratio_row(
+        "CCC = 회수+처리-지불(일)",
+        lambda i: (
+            f"=IFERROR({b_ref('매출채권회수기간(일)', i)}+{b_ref('재고자산처리기간(일)', i)}"
+            f"-{b_ref('매입채무지불기간(일)', i)},NA())"
+        ),
+    )
+    ws.cell(row=row, column=1, value="※ CCC가 짧을수록(마이너스에 가까울수록) 운전자본 부담이 적은 우량한 구조입니다.").font = NOTE
+    row += 2
+
+    # --- F. FCF (잉여현금흐름) ---
+    ws.cell(row=row, column=1, value="F. 잉여현금흐름 (FCF)").font = LABEL
+    row += 1
+    write_ratio_row(
+        "FCF = 영업활동현금흐름 - CAPEX",
+        lambda i: f"=IFERROR({base_cell('영업활동현금흐름', i)}-ABS({base_cell('유형자산의취득', i)}),NA())",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "FCF마진(%, FCF/매출액)",
+        lambda i: f"=IFERROR({b_ref('FCF = 영업활동현금흐름 - CAPEX', i)}/{ind_ref('매출액', i)}*100,NA())"
+        if ind_ref("매출액", i) else "",
+    )
+    row += 1
+
+    # --- G. 현금흐름 3단 구분 ---
+    ws.cell(row=row, column=1, value="G. 현금흐름 3단 구분").font = LABEL
+    row += 1
+    write_ratio_row(
+        "영업활동현금흐름",
+        lambda i: f"={base_cell('영업활동현금흐름', i)}",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "투자활동현금흐름",
+        lambda i: f"={base_cell('투자활동현금흐름', i)}" if extra_hit.get("투자활동현금흐름") else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "재무활동현금흐름",
+        lambda i: f"={base_cell('재무활동현금흐름', i)}" if extra_hit.get("재무활동현금흐름") else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "현금 순증감 (3단 합계, 검증용)",
+        lambda i: (
+            f"=IFERROR({b_ref('영업활동현금흐름', i)}+{b_ref('투자활동현금흐름', i)}+{b_ref('재무활동현금흐름', i)},NA())"
+        ),
+        fmt="#,##0;(#,##0);-",
+    )
+    ws.cell(row=row, column=1, value="※ 검증용 합계는 위 지표 시트의 '현금및현금성자산의증가'와 대체로 비슷해야 합니다(환율 변동 등으로 소폭 차이 가능).").font = NOTE
+    row += 2
+
+    # --- H. DuPont 분해 (ROE) ---
+    ws.cell(row=row, column=1, value="H. DuPont 분해 (ROE = 순이익률 × 총자산회전율 × 레버리지)").font = LABEL
+    row += 1
+    write_ratio_row(
+        "레버리지 (자산/자기자본, 배)",
+        lambda i: f"=IFERROR({ind_ref('자산총계', i)}/{ind_ref('자본총계', i)},NA())"
+        if ind_ref("자산총계", i) and ind_ref("자본총계", i) else "",
+        fmt="0.00",
+    )
+    write_ratio_row(
+        "ROE 검증 (순이익률×회전율×레버리지, %)",
+        lambda i: (
+            f"=IFERROR({b_ref('순이익률(%)', i)}*{b_ref('총자산회전율(회)', i)}*{b_ref('레버리지 (자산/자기자본, 배)', i)},NA())"
+        ),
+    )
+    ws.cell(row=row, column=1, value="※ 위 B섹션의 ROE(%)와 거의 같아야 정상입니다. 크게 다르면 어딘가 계정 매칭이 잘못됐을 가능성이 있습니다.").font = NOTE
+    row += 2
+
+    # --- I. ROIC / NOPLAT (간이 버전) ---
+    ws.cell(row=row, column=1, value="I. ROIC / NOPLAT (간이 계산)").font = LABEL
+    row += 1
+    write_ratio_row(
+        "실효세율(%)",
+        lambda i: f"=IFERROR({base_cell('법인세비용', i)}/{base_cell('법인세차감전순이익', i)}*100,NA())",
+    )
+    write_ratio_row(
+        "NOPLAT = 영업이익×(1-실효세율)",
+        lambda i: f"=IFERROR({ind_ref('영업이익', i)}*(1-{b_ref('실효세율(%)', i)}/100),NA())"
+        if ind_ref("영업이익", i) else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "투하자본(간이) = 자기자본+비유동부채",
+        lambda i: f"=IFERROR({ind_ref('자본총계', i)}+({ind_ref('부채총계', i)}-{ind_ref('유동부채', i)}),NA())"
+        if ind_ref("자본총계", i) and ind_ref("부채총계", i) and ind_ref("유동부채", i) else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "ROIC(간이, %)",
+        lambda i: (
+            f"=IFERROR({b_ref('NOPLAT = 영업이익×(1-실효세율)', i)}/{b_ref('투하자본(간이) = 자기자본+비유동부채', i)}*100,NA())"
+        ),
+    )
+    ws.cell(row=row, column=1, value="※ 간이 버전입니다. 정교한 ROIC은 이자부부채만 골라 투하자본을 계산해야 하는데, 그러려면 단기차입금·사채 등 세부 계정이 더 필요해 여기서는 자기자본+비유동부채로 근사했습니다.").font = NOTE
+    row += 2
+
+    # --- J. 자산·부채 구성비 변화 (간이) ---
+    ws.cell(row=row, column=1, value="J. 자산·부채 구성비 변화 (간이)").font = LABEL
+    row += 1
+    write_ratio_row(
+        "유동자산 비중(%)",
+        lambda i: f"=IFERROR({ind_ref('유동자산', i)}/{ind_ref('자산총계', i)}*100,NA())"
+        if ind_ref("유동자산", i) and ind_ref("자산총계", i) else "",
+    )
+    write_ratio_row(
+        "비유동자산 비중(%)",
+        lambda i: f"=IFERROR({base_cell('비유동자산', i)}/{ind_ref('자산총계', i)}*100,NA())"
+        if ind_ref("자산총계", i) else "",
+    )
+    write_ratio_row(
+        "유동부채 비중(%, 총부채 대비)",
+        lambda i: f"=IFERROR({ind_ref('유동부채', i)}/{ind_ref('부채총계', i)}*100,NA())"
+        if ind_ref("유동부채", i) and ind_ref("부채총계", i) else "",
+    )
+    write_ratio_row(
+        "비유동부채 비중(%, 총부채 대비)",
+        lambda i: f"=IFERROR(({ind_ref('부채총계', i)}-{ind_ref('유동부채', i)})/{ind_ref('부채총계', i)}*100,NA())"
+        if ind_ref("부채총계", i) and ind_ref("유동부채", i) else "",
+    )
+    ws.cell(row=row, column=1, value="※ 유동부채 비중이 계속 커지면 단기 자금조달 의존도가 높아지고 있다는 신호일 수 있습니다.").font = NOTE
+    row += 2
+
+    # --- K. 외환손익 (있는 회사만) ---
+    ws.cell(row=row, column=1, value="K. 외환손익").font = LABEL
+    row += 1
+    has_fx = extra_hit.get("외화환산손익") or extra_hit.get("파생상품손익")
+    write_ratio_row(
+        "외화환산손익",
+        lambda i: f"={base_cell('외화환산손익', i)}" if extra_hit.get("외화환산손익") else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "파생상품손익",
+        lambda i: f"={base_cell('파생상품손익', i)}" if extra_hit.get("파생상품손익") else "",
+        fmt="#,##0;(#,##0);-",
+    )
+    write_ratio_row(
+        "외환손익 합계",
+        lambda i: f"=IFERROR({b_ref('외화환산손익', i)}+{b_ref('파생상품손익', i)},NA())",
+        fmt="#,##0;(#,##0);-",
+    )
+    if not has_fx:
+        ws.cell(row=row, column=1, value="※ 이 회사 공시에서 외화환산손익·파생상품손익 계정을 찾지 못했습니다. 외환 노출이 적거나 다른 계정명을 쓰는 회사일 수 있습니다(매칭 실패 경고에는 포함하지 않았습니다).").font = NOTE
+    row += 2
+
     # --- F. 주가 연동 지표 (KRX 필요) ---
-    ws.cell(row=row, column=1, value="E. 주가 연동 지표 (KRX 종가 기준)").font = LABEL
+    ws.cell(row=row, column=1, value="L. 주가 연동 지표 (KRX 종가 기준)").font = LABEL
     row += 1
     if not stock_code:
         ws.cell(row=row, column=1, value="※ 종목코드가 없어 주가 지표를 건너뜁니다.").font = NOTE
@@ -1000,14 +1306,14 @@ def build_investment_analysis_sheet(
         if not any_price:
             ws.cell(row=row, column=1, value=(
                 "※ 이 회사의 가격 캐시가 하나도 없습니다. "
-                "scripts/fetch_stock_price.py --auth-key <KRX 키> "
+                "scripts/fetch_stock_price.py --auth-key <KRX 인증키> "
                 f"{stock_code} <YYYYMMDD> 를 연도별 결산일 기준으로 먼저 실행하세요."
             )).font = WARN
             row += 1
         row += 1
 
     # --- G. 배당 · 대주주 · 자기주식 (DART 추가 공시) ---
-    ws.cell(row=row, column=1, value="F. 배당 · 대주주 · 자기주식").font = LABEL
+    ws.cell(row=row, column=1, value="M. 배당 · 대주주 · 자기주식").font = LABEL
     row += 1
     latest_year = year_list[-1] if year_list else None
     extra = load_extra_disclosures(corp_code, latest_year) if latest_year else None
@@ -1048,7 +1354,7 @@ def build_investment_analysis_sheet(
     row += 1
 
     # --- H. 투자 판단 (정성 평가 — 사용자가 직접 채우는 템플릿) ---
-    ws.cell(row=row, column=1, value="G. 투자 판단 (A~E로 직접 평가)").font = LABEL
+    ws.cell(row=row, column=1, value="N. 투자 판단 (A~E로 직접 평가)").font = LABEL
     row += 1
     ws.cell(row=row, column=1, value="항목")
     ws.cell(row=row, column=2, value="평가(A~E)")
@@ -1075,6 +1381,11 @@ def main() -> None:
     ap.add_argument("--years", type=int, default=5)
     ap.add_argument("--quarters", type=int, default=12)
     ap.add_argument("--outdir", default="/mnt/user-data/outputs")
+    ap.add_argument(
+        "--period", choices=["annual", "quarterly", "both"], default="both",
+        help="annual: 연간 시트만 담은 파일 하나, quarterly: 분기 시트만 담은 파일 하나, "
+             "both(기본값): 기존처럼 한 파일에 다 담기",
+    )
     args = ap.parse_args()
 
     reports = load_cache(args.corp_code)
@@ -1082,17 +1393,20 @@ def main() -> None:
         print(f"ERROR: {args.corp_code}에 대한 캐시 데이터가 없습니다. fetch_financials.py를 먼저 실행하세요.", file=sys.stderr)
         sys.exit(1)
 
-    quarter_plan = build_quarter_plan(reports, args.quarters)
-    year_list = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years]
+    want_quarterly = args.period in ("quarterly", "both")
+    want_annual = args.period in ("annual", "both")
+
+    quarter_plan = build_quarter_plan(reports, args.quarters) if want_quarterly else []
+    year_list = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years] if want_annual else []
     year_list.sort()  # 오래된 -> 최근
 
-    if len(quarter_plan) < args.quarters:
+    if want_quarterly and len(quarter_plan) < args.quarters:
         print(
             f"WARNING: 요청한 {args.quarters}분기 중 {len(quarter_plan)}분기만 채웠습니다 "
             f"(공시 지연 또는 상장 이력 부족 가능).",
             file=sys.stderr,
         )
-    if len(year_list) < args.years:
+    if want_annual and len(year_list) < args.years:
         print(
             f"WARNING: 요청한 {args.years}개년 중 {len(year_list)}개년만 채웠습니다.",
             file=sys.stderr,
@@ -1102,11 +1416,10 @@ def main() -> None:
     wb.remove(wb.active)
 
     cell_index = write_raw_sheet(wb, quarter_plan, year_list, reports)
-    q_row_map, q_name_map, q_labels = build_quarterly_sheet(wb, quarter_plan, cell_index)
-    y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
 
     all_missing: dict[str, list[str]] = {}
     if quarter_plan:
+        q_row_map, q_name_map, q_labels = build_quarterly_sheet(wb, quarter_plan, cell_index)
         q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
             wb, "분기", "분기_재무제표", q_labels, q_row_map, q_name_map
         )
@@ -1114,6 +1427,7 @@ def main() -> None:
         if q_missing:
             all_missing["분기"] = q_missing
     if year_list:
+        y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
         y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
             wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
         )
@@ -1141,11 +1455,13 @@ def main() -> None:
     today = dt.date.today().strftime("%Y%m%d")
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    outfile = outdir / f"{args.company_name}_{today}.xlsx"
+    suffix = {"annual": "_연간", "quarterly": "_분기", "both": ""}[args.period]
+    outfile = outdir / f"{args.company_name}{suffix}_{today}.xlsx"
     wb.save(outfile)
     print(json.dumps(
         {
             "saved": str(outfile),
+            "period": args.period,
             "quarters_filled": len(quarter_plan),
             "years_filled": len(year_list),
             "missing_indicators": all_missing,
