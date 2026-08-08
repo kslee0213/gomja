@@ -172,6 +172,11 @@ def main() -> None:
     ap.add_argument("--years", type=int, default=5)
     ap.add_argument("--quarters", type=int, default=12)
     ap.add_argument("--outdir", default="/mnt/user-data/outputs")
+    ap.add_argument(
+        "--period", choices=["annual", "quarterly", "both"], default="both",
+        help="annual: '최근5년 비교' 시트만 담은 파일 하나, quarterly: '12분기 비교' 시트만 담은 파일 하나, "
+             "both(기본값): 기존처럼 한 파일에 둘 다",
+    )
     args = ap.parse_args()
 
     if len(args.companies) < 2:
@@ -199,16 +204,21 @@ def main() -> None:
         all_reports[name] = (corp_code, reports)
 
     # 회사별 자연 기간(quarter_plan/year_list)을 각각 구해 합집합(unified) 기간 축을 만든다.
+    want_quarterly = args.period in ("quarterly", "both")
+    want_annual = args.period in ("annual", "both")
+
     union_quarters: set[tuple[str, int]] = set()
     union_years: set[str] = set()
     for name, (corp_code, reports) in all_reports.items():
-        qp = build_quarter_plan(reports, args.quarters)
-        yl = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years]
-        union_quarters.update((p["year"], p["q"]) for p in qp)
-        union_years.update(yl)
+        if want_quarterly:
+            qp = build_quarter_plan(reports, args.quarters)
+            union_quarters.update((p["year"], p["q"]) for p in qp)
+        if want_annual:
+            yl = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years]
+            union_years.update(yl)
 
-    unified_quarters = sorted(union_quarters, key=lambda t: (t[0], t[1]))[-args.quarters:]
-    unified_years = sorted(union_years)[-args.years:]
+    unified_quarters = sorted(union_quarters, key=lambda t: (t[0], t[1]))[-args.quarters:] if want_quarterly else []
+    unified_years = sorted(union_years)[-args.years:] if want_annual else []
 
     if not unified_quarters and not unified_years:
         print("ERROR: 비교할 기업들의 캐시 데이터에서 유효한 기간을 찾지 못했습니다.", file=sys.stderr)
@@ -229,27 +239,30 @@ def main() -> None:
         raw_sheet_name = safe_sheet_title(f"원본_{name}")
 
         cell_index = write_raw_sheet(wb, company_quarter_plan, unified_years, reports, sheet_name=raw_sheet_name)
-        q_row_map, q_name_map, q_labels = build_quarterly_sheet(
-            wb, company_quarter_plan, cell_index, sheet_name=q_sheet_name, hidden=True
-        )
-        y_row_map, y_name_map, y_labels = build_annual_sheet(
-            wb, unified_years, reports, cell_index, sheet_name=y_sheet_name, hidden=True
-        )
 
-        q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
-            wb, "q", q_sheet_name, q_labels, q_row_map, q_name_map,
-            sheet_name=safe_sheet_title(f"지표_{name}_분기", 31), hidden=True,
-        )
-        y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
-            wb, "y", y_sheet_name, y_labels, y_row_map, y_name_map,
-            sheet_name=safe_sheet_title(f"지표_{name}_연간", 31), hidden=True,
-        )
-        q_rowmaps[name] = (q_ind_sheet, q_row_of)
-        y_rowmaps[name] = (y_ind_sheet, y_row_of)
-        if q_missing:
-            all_missing.setdefault(name, {})["분기"] = q_missing
-        if y_missing:
-            all_missing.setdefault(name, {})["연간"] = y_missing
+        if unified_quarters:
+            q_row_map, q_name_map, q_labels = build_quarterly_sheet(
+                wb, company_quarter_plan, cell_index, sheet_name=q_sheet_name, hidden=True
+            )
+            q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
+                wb, "q", q_sheet_name, q_labels, q_row_map, q_name_map,
+                sheet_name=safe_sheet_title(f"지표_{name}_분기", 31), hidden=True,
+            )
+            q_rowmaps[name] = (q_ind_sheet, q_row_of)
+            if q_missing:
+                all_missing.setdefault(name, {})["분기"] = q_missing
+
+        if unified_years:
+            y_row_map, y_name_map, y_labels = build_annual_sheet(
+                wb, unified_years, reports, cell_index, sheet_name=y_sheet_name, hidden=True
+            )
+            y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
+                wb, "y", y_sheet_name, y_labels, y_row_map, y_name_map,
+                sheet_name=safe_sheet_title(f"지표_{name}_연간", 31), hidden=True,
+            )
+            y_rowmaps[name] = (y_ind_sheet, y_row_of)
+            if y_missing:
+                all_missing.setdefault(name, {})["연간"] = y_missing
 
     q_period_labels = [f"{y}Q{q}" for (y, q) in unified_quarters]
     y_period_labels = [f"{y}(사업보고서)" for y in unified_years]
@@ -268,12 +281,14 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     names_joined = ", ".join(name for _, name in parsed)
-    outfile = outdir / f"{names_joined} 비교_{today}.xlsx"
+    suffix = {"annual": "_연간", "quarterly": "_분기", "both": ""}[args.period]
+    outfile = outdir / f"{names_joined} 비교{suffix}_{today}.xlsx"
     wb.save(outfile)
 
     print(json.dumps(
         {
             "saved": str(outfile),
+            "period": args.period,
             "companies": [name for _, name in parsed],
             "unified_quarters": len(unified_quarters),
             "unified_years": len(unified_years),
