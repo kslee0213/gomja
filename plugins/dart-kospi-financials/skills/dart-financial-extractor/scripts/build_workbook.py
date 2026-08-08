@@ -662,6 +662,207 @@ def build_chart_sheet(
 
 
 # ---------------------------------------------------------------------------
+# 투자 판단 자동 평가 (v0.8.0)
+# 첨부 참고자료("투자판단 항목 평가기준")의 수치 기준을 그대로 코드화한다.
+# 등급 규칙: 최근 5개년 중 기준 충족 연수로 A~E를 매기되, 기준에 계속 미달해도
+# 5년 내내 개선 추세면 A로 승격한다(사용자 지정 규칙).
+# ---------------------------------------------------------------------------
+
+def grade_by_hit_years(hits: list[bool | None]) -> tuple[str, int, int]:
+    """hits: 연도별 기준 충족 여부(None=데이터 없음).
+    반환: (등급, 충족연수, 판정가능연수)"""
+    valid = [h for h in hits if h is not None]
+    if not valid:
+        return "-", 0, 0
+    k = sum(1 for h in valid if h)
+    total = len(valid)
+    # 5개년이 아닌 경우(상장 이력 부족 등)에도 같은 비율로 환산해 판정한다.
+    scaled = round(k / total * 5) if total else 0
+    grade = {5: "A", 4: "B", 3: "C", 2: "D"}.get(scaled, "E")
+    return grade, k, total
+
+
+def is_consistently_improving(values: list[float | None], higher_is_better: bool = True) -> bool:
+    """연도별 값이 계속 개선되는 추세인지(모든 구간에서 단조 개선) 판정한다.
+    데이터가 3개 미만이면 판단하지 않는다(False)."""
+    vals = [v for v in values if v is not None]
+    if len(vals) < 3:
+        return False
+    for prev, cur in zip(vals, vals[1:]):
+        if higher_is_better and cur <= prev:
+            return False
+        if not higher_is_better and cur >= prev:
+            return False
+    return True
+
+
+def evaluate_metric(
+    values: list[float | None],
+    threshold: float,
+    higher_is_better: bool = True,
+) -> tuple[str, int, int, bool]:
+    """단일 지표를 등급화한다. 반환: (등급, 충족연수, 판정가능연수, 개선승격여부)"""
+    hits = [
+        None if v is None else (v >= threshold if higher_is_better else v <= threshold)
+        for v in values
+    ]
+    grade, k, total = grade_by_hit_years(hits)
+    improved = False
+    if grade not in ("A", "-") and is_consistently_improving(values, higher_is_better):
+        grade = "A"
+        improved = True
+    return grade, k, total, improved
+
+
+def combine_grades(grades: list[str]) -> str:
+    """여러 하위 지표 등급의 평균으로 항목 등급을 낸다(A=5 ... E=1)."""
+    score_map = {"A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
+    scores = [score_map[g] for g in grades if g in score_map]
+    if not scores:
+        return "-"
+    avg = sum(scores) / len(scores)
+    if avg >= 4.5:
+        return "A"
+    if avg >= 3.5:
+        return "B"
+    if avg >= 2.5:
+        return "C"
+    if avg >= 1.5:
+        return "D"
+    return "E"
+
+
+def render_investment_judgement(
+    ws, row: int, n: int, y_period_labels: list[str],
+    raw: dict[str, list[float | None]],
+    extra_disclosure: dict | None,
+    price_available: bool,
+) -> int:
+    """N. 투자 판단 표를 자동 평가로 채운다. 반환: 다음 행 번호.
+    raw: 지표명 -> 연도별 값 리스트(오래된->최근). 값이 없으면 None."""
+
+    def fmt_years(k: int, total: int) -> str:
+        return f"{total}년 중 {k}년 충족"
+
+    results: list[tuple[str, str, str]] = []  # (항목, 등급, 근거)
+
+    # --- 재무건전성: 자기자본비율 40%↑, 부채비율 200%↓, 유동비율 100%↑ ---
+    g1, k1, t1, i1 = evaluate_metric(raw.get("자기자본비율", []), 40, True)
+    g2, k2, t2, i2 = evaluate_metric(raw.get("부채비율", []), 200, False)
+    g3, k3, t3, i3 = evaluate_metric(raw.get("유동비율", []), 100, True)
+    parts = [
+        f"자기자본비율 40%↑ {fmt_years(k1, t1)}({g1}{', 지속개선' if i1 else ''})",
+        f"부채비율 200%↓ {fmt_years(k2, t2)}({g2}{', 지속개선' if i2 else ''})",
+        f"유동비율 100%↑ {fmt_years(k3, t3)}({g3}{', 지속개선' if i3 else ''})",
+    ]
+    results.append(("재무건전성", combine_grades([g1, g2, g3]), " / ".join(parts)))
+
+    # --- 수익성: 영업이익률 5%↑, ROE 10%↑, ROA 5%↑ ---
+    g4, k4, t4, i4 = evaluate_metric(raw.get("영업이익률", []), 5, True)
+    g5, k5, t5, i5 = evaluate_metric(raw.get("ROE", []), 10, True)
+    g6, k6, t6, i6 = evaluate_metric(raw.get("ROA", []), 5, True)
+    parts = [
+        f"영업이익률 5%↑ {fmt_years(k4, t4)}({g4}{', 지속개선' if i4 else ''})",
+        f"ROE 10%↑ {fmt_years(k5, t5)}({g5}{', 지속개선' if i5 else ''})",
+        f"ROA 5%↑ {fmt_years(k6, t6)}({g6}{', 지속개선' if i6 else ''})",
+    ]
+    results.append(("수익성", combine_grades([g4, g5, g6]), " / ".join(parts)))
+
+    # --- 성장성: 매출성장률 10%↑, 영업이익성장률 0%↑(플러스), 총자산회전율 1.0↑ ---
+    g7, k7, t7, i7 = evaluate_metric(raw.get("매출성장률", []), 10, True)
+    g8, k8, t8, i8 = evaluate_metric(raw.get("영업이익성장률", []), 0, True)
+    g9, k9, t9, i9 = evaluate_metric(raw.get("총자산회전율", []), 1.0, True)
+    parts = [
+        f"매출성장률 10%↑ {fmt_years(k7, t7)}({g7}{', 지속개선' if i7 else ''})",
+        f"영업이익성장률 + {fmt_years(k8, t8)}({g8}{', 지속개선' if i8 else ''})",
+        f"총자산회전율 1.0↑ {fmt_years(k9, t9)}({g9}{', 지속개선' if i9 else ''})",
+    ]
+    results.append(("성장성", combine_grades([g7, g8, g9]), " / ".join(parts)))
+
+    # --- 자산으로 본 저평가 정도: PBR 1.0 미만이면 저평가 ---
+    if price_available and raw.get("PBR"):
+        gA, kA, tA, iA = evaluate_metric(raw["PBR"], 1.0, False)
+        results.append((
+            "자산으로 본 저평가 정도", gA,
+            f"PBR 1.0 미만 {fmt_years(kA, tA)}({gA}{', 지속개선' if iA else ''}). "
+            f"청산가치 대비 시가총액은 D·L 섹션 참고."
+        ))
+    else:
+        results.append((
+            "자산으로 본 저평가 정도", "-",
+            "주가 데이터 없음 — KRX 인증키로 fetch_stock_price.py 실행 후 재생성하면 자동 평가됩니다."
+        ))
+
+    # --- 수익 창출 능력으로 본 저평가 정도: PER 15 미만 ---
+    if price_available and raw.get("PER"):
+        gB, kB, tB, iB = evaluate_metric(raw["PER"], 15.0, False)
+        results.append((
+            "수익 창출 능력으로 본 저평가 정도", gB,
+            f"PER 15배 미만 {fmt_years(kB, tB)}({gB}{', 지속개선' if iB else ''}). "
+            f"PSR은 L섹션 참고."
+        ))
+    else:
+        results.append((
+            "수익 창출 능력으로 본 저평가 정도", "-",
+            "주가 데이터 없음 — KRX 인증키로 fetch_stock_price.py 실행 후 재생성하면 자동 평가됩니다."
+        ))
+
+    # --- 사업역량: 정성 판단 영역 (자동 평가하지 않음) ---
+    results.append((
+        "사업역량", "(직접 입력)",
+        "사업 단순성·매입처/판매처 분산·경쟁력은 공시 수치로 판단할 수 없습니다. "
+        "사업보고서의 사업의 내용, 매출 구성, 주요 거래처를 직접 확인해 채워 주세요."
+    ))
+
+    # --- 주주 중시 자세: 배당성향 + 자사주 + 증자 이력 ---
+    payout_txt = "배당성향 정보 없음"
+    treasury_txt = ""
+    grade_shareholder = "-"
+    if extra_disclosure:
+        div = extra_disclosure.get("배당", {})
+        div_list = div.get("list", []) if isinstance(div, dict) else []
+        payout_raw = next(
+            (x.get("thstrm") for x in div_list if "배당성향" in (x.get("se") or "")), None
+        )
+        payout_val = None
+        if payout_raw:
+            try:
+                payout_val = float(str(payout_raw).replace(",", "").replace("%", "").strip())
+            except ValueError:
+                payout_val = None
+        if payout_val is not None:
+            payout_txt = f"배당성향 {payout_val:.1f}%"
+            # 참고자료에 명시적 컷오프가 없어 통상 기준(20% 이상 주주환원 적극)을 쓴다.
+            grade_shareholder = "A" if payout_val >= 30 else "B" if payout_val >= 20 else "C" if payout_val > 0 else "D"
+        elif payout_raw:
+            payout_txt = f"배당성향 {payout_raw}"
+
+        treasury = extra_disclosure.get("자기주식현황", {})
+        t_list = treasury.get("list", []) if isinstance(treasury, dict) else []
+        if t_list:
+            treasury_txt = " / 자기주식 보유·취득 이력 있음(긍정 신호)"
+
+    results.append((
+        "주주 중시 자세", grade_shareholder,
+        f"{payout_txt}{treasury_txt}. "
+        "※ 참고자료가 경고한 '증자로 자금을 해결하는 기업'인지는 DART 유상증자 공시를 별도로 확인해야 합니다(자동 판별 불가)."
+    ))
+
+    # --- 표 렌더링 ---
+    for item, grade, memo in results:
+        ws.cell(row=row, column=1, value=item)
+        c = ws.cell(row=row, column=2, value=grade)
+        if grade in ("A", "B"):
+            c.font = Font(name=FONT_NAME, bold=True, color="1F7A1F")
+        elif grade in ("D", "E"):
+            c.font = Font(name=FONT_NAME, bold=True, color="C00000")
+        ws.cell(row=row, column=3, value=memo)
+        row += 1
+
+    return row
+
+
+# ---------------------------------------------------------------------------
 # 투자분석 시트 (v0.4.0) — 첨부 자료("기업 분석 리포트 쓰는 법")의 재무지표/
 # 위험신호/청산가치/주가지표 체크리스트를 자동 계산한다.
 # ---------------------------------------------------------------------------
@@ -718,6 +919,7 @@ def build_investment_analysis_sheet(
     y_account_name_map: dict,
     y_ind_sheet: str,
     y_row_of: dict,
+    reports: dict | None = None,
 ) -> list[str]:
     """'투자분석' 시트를 만든다. 반환값: 이번에 못 찾은/못 가져온 항목 경고 목록."""
     ws = wb.create_sheet("투자분석")
@@ -1538,17 +1740,96 @@ def build_investment_analysis_sheet(
     row += 1
 
     # --- H. 투자 판단 (정성 평가 — 사용자가 직접 채우는 템플릿) ---
-    ws.cell(row=row, column=1, value="N. 투자 판단 (A~E로 직접 평가)").font = LABEL
+    ws.cell(row=row, column=1, value="N. 투자 판단 (자동 평가 · A~E)").font = LABEL
     row += 1
     ws.cell(row=row, column=1, value="항목")
     ws.cell(row=row, column=2, value="평가(A~E)")
     ws.cell(row=row, column=3, value="근거 메모")
     style_header(ws, row, 3)
     row += 1
-    for item in ["자산으로 본 저평가 정도", "수익 창출 능력으로 본 저평가 정도", "재무건전성", "수익성", "성장성", "사업역량", "주주 중시 자세"]:
-        ws.cell(row=row, column=1, value=item)
-        row += 1
-    ws.cell(row=row, column=1, value="※ 위 표는 자동 계산이 아닌 서식입니다. 위 B~F 섹션의 수치를 참고해 직접 평가해 주세요.").font = NOTE
+
+    # 등급 판정을 위해 원자료(cache)에서 지표값을 직접 계산한다.
+    # (시트 셀은 수식이라 openpyxl로는 값을 읽을 수 없어 원자료를 다시 계산한다)
+    def series(key: str) -> list[float | None]:
+        hit = resolve_metric(key, y_account_row_map, y_account_name_map) if key in METRIC_RULES else None
+        out: list[float | None] = []
+        for year in year_list:
+            fy = (reports or {}).get(year, {}).get("11011")
+            out.append(amount_lookup(fy, hit[0], hit[1]) if (fy and hit) else None)
+        return out
+
+    def ratio(nums: list[float | None], dens: list[float | None], mult: float = 100.0) -> list[float | None]:
+        out: list[float | None] = []
+        for a, b in zip(nums, dens):
+            out.append(a / b * mult if (a is not None and b not in (None, 0)) else None)
+        return out
+
+    def yoy(vals: list[float | None]) -> list[float | None]:
+        out: list[float | None] = [None]
+        for prev, cur in zip(vals, vals[1:]):
+            out.append((cur - prev) / prev * 100 if (prev not in (None, 0) and cur is not None) else None)
+        return out
+
+    s_revenue = series("매출액")
+    s_op = series("영업이익")
+    s_ni = series("당기순이익")
+    s_assets = series("자산총계")
+    s_equity = series("자본총계")
+    s_liab = series("부채총계")
+    s_ca = series("유동자산")
+    s_cl = series("유동부채")
+
+    raw_metrics = {
+        "자기자본비율": ratio(s_equity, s_assets),
+        "부채비율": ratio(s_liab, s_equity),
+        "유동비율": ratio(s_ca, s_cl),
+        "영업이익률": ratio(s_op, s_revenue),
+        "ROE": ratio(s_ni, s_equity),
+        "ROA": ratio(s_ni, s_assets),
+        "매출성장률": yoy(s_revenue),
+        "영업이익성장률": yoy(s_op),
+        "총자산회전율": ratio(s_revenue, s_assets, mult=1.0),
+    }
+
+    # 주가 지표(PER/PBR)는 가격 캐시가 있을 때만 계산한다.
+    per_list: list[float | None] = []
+    pbr_list: list[float | None] = []
+    price_available = False
+    if stock_code:
+        for i, year in enumerate(year_list):
+            price = load_price(stock_code, f"{year}1231")
+            if not price:
+                per_list.append(None)
+                pbr_list.append(None)
+                continue
+            close = _fmt_num(price.get("close_price"))
+            listed = _fmt_num(price.get("listed_shares"))
+            mc = _fmt_num(price.get("market_cap")) or (close * listed if close and listed else None)
+            if mc is None:
+                per_list.append(None)
+                pbr_list.append(None)
+                continue
+            price_available = True
+            ni, eq = s_ni[i], s_equity[i]
+            per_list.append(mc / ni if ni not in (None, 0) else None)
+            pbr_list.append(mc / eq if eq not in (None, 0) else None)
+    if price_available:
+        raw_metrics["PER"] = per_list
+        raw_metrics["PBR"] = pbr_list
+
+    row = render_investment_judgement(
+        ws, row, n, y_period_labels, raw_metrics, extra, price_available
+    )
+
+    ws.cell(row=row, column=1, value=(
+        "※ 등급 규칙: 최근 5개년 중 기준 충족 연수로 A(5년)~E(0~1년)를 매기되, "
+        "기준 미달이어도 5년 내내 수치가 개선되면 A로 승격합니다. "
+        "기준값은 첨부 참고자료(투자판단 항목 평가기준)를 따랐습니다."
+    )).font = NOTE
+    row += 1
+    ws.cell(row=row, column=1, value=(
+        "※ '사업역량'은 공시 수치로 판단할 수 없어 직접 입력 항목으로 남겨두었습니다."
+    )).font = NOTE
 
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 16
@@ -1622,7 +1903,7 @@ def main() -> None:
 
         ia_warnings = build_investment_analysis_sheet(
             wb, args.company_name, args.corp_code, y_labels, year_list,
-            y_row_map, y_name_map, y_ind_sheet, y_row_of,
+            y_row_map, y_name_map, y_ind_sheet, y_row_of, reports,
         )
         if ia_warnings:
             all_missing["투자분석(계정 매칭 실패)"] = ia_warnings
