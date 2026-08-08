@@ -265,7 +265,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
     ws.cell(row=header_row, column=1, value="구분")
     ws.cell(row=header_row, column=2, value="계정과목")
     for i, year in enumerate(year_list):
-        ws.cell(row=header_row, column=3 + i, value=f"{year}(사업보고서)")
+        ws.cell(row=header_row, column=3 + i, value=f"{year}")
     style_header(ws, header_row, 2 + len(year_list))
 
     account_row_map: dict[tuple[str, str], int] = {}
@@ -300,7 +300,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
         ws.column_dimensions[get_column_letter(3 + i)].width = 18
     ws.freeze_panes = "C4"
 
-    period_labels = [f"{year}(사업보고서)" for year in year_list]
+    period_labels = [f"{year}" for year in year_list]
     return account_row_map, account_name_map, period_labels
 
 
@@ -608,10 +608,19 @@ def _add_line_series(chart: LineChart, ws, row_of: dict, names: list[str], n_per
 
 
 def build_chart_sheet(
-    wb: Workbook, prefix: str, indicator_sheet_name: str, row_of: dict, n_periods: int
+    wb: Workbook, prefix: str, indicator_sheet_name: str, row_of: dict, n_periods: int,
+    embed_anchor_col: str | None = None,
 ):
-    ws = wb.create_sheet(f"차트_{prefix}")
+    """차트를 그린다. embed_anchor_col이 주어지면 별도 시트를 만들지 않고
+    지표 시트(indicator_sheet_name) 자체의 그 열부터 차트를 배치한다
+    (표와 겹치지 않도록 호출하는 쪽에서 표 폭보다 오른쪽 열을 넘겨야 한다)."""
     ind_ws = wb[indicator_sheet_name]
+    if embed_anchor_col:
+        ws = ind_ws
+        anchor_col = embed_anchor_col
+    else:
+        ws = wb.create_sheet(f"차트_{prefix}")
+        anchor_col = "A"
     cat_ref = Reference(ind_ws, min_col=3, max_col=2 + n_periods, min_row=1, max_row=1)
 
     anchor_row = 1
@@ -625,7 +634,7 @@ def build_chart_sheet(
         chart.width = 22
         _add_line_series(chart, ind_ws, row_of, names, n_periods)
         chart.set_categories(cat_ref)
-        ws.add_chart(chart, f"A{anchor_row}")
+        ws.add_chart(chart, f"{anchor_col}{anchor_row}")
         anchor_row += 19
 
     # 비율 막대그래프 (계열 6개)
@@ -646,9 +655,10 @@ def build_chart_sheet(
         series = Series(data_ref, title=name)
         bar.series.append(series)
     bar.set_categories(cat_ref)
-    ws.add_chart(bar, f"A{anchor_row}")
+    ws.add_chart(bar, f"{anchor_col}{anchor_row}")
 
-    ws.sheet_view.showGridLines = False
+    if not embed_anchor_col:
+        ws.sheet_view.showGridLines = False
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +883,69 @@ def build_investment_analysis_sheet(
         col = get_column_letter(3 + i)
         return f"{col}{b_row[name]}"
 
+    def write_period_header():
+        """E~L 각 섹션 표 위에 연도 헤더 행을 쓴다."""
+        nonlocal row
+        ws.cell(row=row, column=1, value="지표")
+        for i, label in enumerate(y_period_labels):
+            ws.cell(row=row, column=3 + i, value=label)
+        style_header(ws, row, 2 + n)
+        row += 1
+
+    chart_anchor_row = [1]  # 차트를 세로로 쌓아 내려갈 위치 (리스트로 감싸 클로저에서 갱신)
+    CHART_ANCHOR_COL = "N"
+
+    def add_section_chart(
+        title: str,
+        primary_names: list[str],
+        secondary_names: list[str] | None = None,
+        primary_ytitle: str = "",
+        secondary_ytitle: str = "",
+    ):
+        """b_row에 등록된 행 이름들을 계열로 하는 막대그래프를 투자분석 시트
+        오른쪽(N열부터)에 세로로 쌓아 추가한다. secondary_names가 있으면
+        보조축이 있는 콤보 막대그래프로 만든다."""
+        # 카테고리(연도)는 B섹션 표 헤더 행(ratio_header, 연도 라벨이 있는 행)을 공용으로 쓴다.
+        cat_ref = Reference(ws, min_col=3, max_col=2 + n, min_row=ratio_header, max_row=ratio_header)
+        chart = BarChart()
+        chart.type = "col"
+        chart.grouping = "clustered"
+        chart.title = title
+        chart.style = 10
+        chart.y_axis.title = primary_ytitle
+        chart.x_axis.title = "기간"
+        chart.height = 8.5
+        chart.width = 22
+        for name in primary_names:
+            r = b_row.get(name)
+            if not r:
+                continue
+            data_ref = Reference(ws, min_col=3, max_col=2 + n, min_row=r, max_row=r)
+            chart.series.append(Series(data_ref, title=name))
+        chart.set_categories(cat_ref)
+
+        if secondary_names:
+            chart2 = BarChart()
+            chart2.type = "col"
+            chart2.grouping = "clustered"
+            for name in secondary_names:
+                r = b_row.get(name)
+                if not r:
+                    continue
+                data_ref = Reference(ws, min_col=3, max_col=2 + n, min_row=r, max_row=r)
+                chart2.series.append(Series(data_ref, title=name))
+            chart2.set_categories(cat_ref)
+            chart2.y_axis.axId = 200
+            chart2.y_axis.title = secondary_ytitle
+            chart2.y_axis.axPos = "r"
+            # openpyxl 공식 콤보 차트 패턴: 1차 축이 보조축의 최댓값 쪽에서
+            # 교차하도록 지정해야 Excel에서 보조축이 오른쪽에 분리되어 나온다.
+            chart.y_axis.crosses = "max"
+            chart += chart2
+
+        ws.add_chart(chart, f"{CHART_ANCHOR_COL}{chart_anchor_row[0]}")
+        chart_anchor_row[0] += 18
+
     ws.cell(row=row, column=1, value="[건전성]").font = Font(name=FONT_NAME, italic=True)
     row += 1
     write_ratio_row("자기자본비율(%)", lambda i: f"={ind_ref('자기자본비율', i)}" if ind_ref('자기자본비율', i) else "")
@@ -998,6 +1071,29 @@ def build_investment_analysis_sheet(
     )
     row += 1
 
+    # --- B섹션 4개 그룹 각각 콤보(보조축) 막대그래프 ---
+    add_section_chart(
+        "건전성 지표",
+        ["자기자본비율(%)", "부채비율(%)", "유동비율(%)", "당좌비율(%)", "고정비율(%)", "고정장기적합율(%)", "순운전자본대총자본비율(%)"],
+        ["이자보상배율(배)"],
+        primary_ytitle="%", secondary_ytitle="배",
+    )
+    add_section_chart(
+        "수익성 지표",
+        ["매출총이익률(%)", "영업이익률(%)", "세전순이익률(%)", "순이익률(%)", "ROE(%)", "ROA(%)"],
+        primary_ytitle="%",
+    )
+    add_section_chart(
+        "성장성 지표",
+        ["매출성장률(%, YoY)", "영업이익성장률(%, YoY)", "순이익성장률(%, YoY)", "총자산증가율(%, YoY)", "자기자본증가율(%, YoY)", "유형자산증가율(%, YoY)"],
+        primary_ytitle="%",
+    )
+    add_section_chart(
+        "활동성 지표",
+        ["총자산회전율(회)", "매출채권회전율(회)", "자기자본회전율(회)", "유형자산회전율(회)", "재고자산회전율(회)", "매입채무회전율(회)"],
+        primary_ytitle="회",
+    )
+
     # --- D. 위험 신호 점검 ---
     ws.cell(row=row, column=1, value="C. 위험 신호 점검").font = LABEL
     row += 1
@@ -1109,6 +1205,7 @@ def build_investment_analysis_sheet(
     # --- E. CCC (현금전환주기) ---
     ws.cell(row=row, column=1, value="E. 현금전환주기 (CCC)").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "매출채권회수기간(일)",
         lambda i: f"=IFERROR(365/{b_ref('매출채권회전율(회)', i)},NA())",
@@ -1132,8 +1229,15 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- F. FCF (잉여현금흐름) ---
+    add_section_chart(
+        "현금전환주기 (CCC)",
+        ["매출채권회수기간(일)", "재고자산처리기간(일)", "매입채무지불기간(일)", "CCC = 회수+처리-지불(일)"],
+        primary_ytitle="일",
+    )
+
     ws.cell(row=row, column=1, value="F. 잉여현금흐름 (FCF)").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "FCF = 영업활동현금흐름 - CAPEX",
         lambda i: f"=IFERROR({base_cell('영업활동현금흐름', i)}-ABS({base_cell('유형자산의취득', i)}),NA())",
@@ -1147,8 +1251,16 @@ def build_investment_analysis_sheet(
     row += 1
 
     # --- G. 현금흐름 3단 구분 ---
+    add_section_chart(
+        "잉여현금흐름 (FCF)",
+        ["FCF = 영업활동현금흐름 - CAPEX"],
+        ["FCF마진(%, FCF/매출액)"],
+        primary_ytitle="원", secondary_ytitle="%",
+    )
+
     ws.cell(row=row, column=1, value="G. 현금흐름 3단 구분").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "영업활동현금흐름",
         lambda i: f"={base_cell('영업활동현금흐름', i)}",
@@ -1175,8 +1287,15 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- H. DuPont 분해 (ROE) ---
+    add_section_chart(
+        "현금흐름 3단 구분",
+        ["영업활동현금흐름", "투자활동현금흐름", "재무활동현금흐름", "현금 순증감 (3단 합계, 검증용)"],
+        primary_ytitle="원",
+    )
+
     ws.cell(row=row, column=1, value="H. DuPont 분해 (ROE = 순이익률 × 총자산회전율 × 레버리지)").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "레버리지 (자산/자기자본, 배)",
         lambda i: f"=IFERROR({ind_ref('자산총계', i)}/{ind_ref('자본총계', i)},NA())"
@@ -1193,8 +1312,16 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- I. ROIC / NOPLAT (간이 버전) ---
+    add_section_chart(
+        "DuPont 분해 (ROE)",
+        ["ROE 검증 (순이익률×회전율×레버리지, %)"],
+        ["레버리지 (자산/자기자본, 배)"],
+        primary_ytitle="%", secondary_ytitle="배",
+    )
+
     ws.cell(row=row, column=1, value="I. ROIC / NOPLAT (간이 계산)").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "실효세율(%)",
         lambda i: f"=IFERROR({base_cell('법인세비용', i)}/{base_cell('법인세차감전순이익', i)}*100,NA())",
@@ -1221,8 +1348,16 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- J. 자산·부채 구성비 변화 (간이) ---
+    add_section_chart(
+        "ROIC / NOPLAT (간이)",
+        ["NOPLAT = 영업이익×(1-실효세율)", "투하자본(간이) = 자기자본+비유동부채"],
+        ["실효세율(%)", "ROIC(간이, %)"],
+        primary_ytitle="원", secondary_ytitle="%",
+    )
+
     ws.cell(row=row, column=1, value="J. 자산·부채 구성비 변화 (간이)").font = LABEL
     row += 1
+    write_period_header()
     write_ratio_row(
         "유동자산 비중(%)",
         lambda i: f"=IFERROR({ind_ref('유동자산', i)}/{ind_ref('자산총계', i)}*100,NA())"
@@ -1247,8 +1382,15 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- K. 외환손익 (있는 회사만) ---
+    add_section_chart(
+        "자산·부채 구성비 변화",
+        ["유동자산 비중(%)", "비유동자산 비중(%)", "유동부채 비중(%, 총부채 대비)", "비유동부채 비중(%, 총부채 대비)"],
+        primary_ytitle="%",
+    )
+
     ws.cell(row=row, column=1, value="K. 외환손익").font = LABEL
     row += 1
+    write_period_header()
     has_fx = extra_hit.get("외화환산손익") or extra_hit.get("파생상품손익")
     write_ratio_row(
         "외화환산손익",
@@ -1270,45 +1412,68 @@ def build_investment_analysis_sheet(
     row += 2
 
     # --- F. 주가 연동 지표 (KRX 필요) ---
+    add_section_chart(
+        "외환손익",
+        ["외화환산손익", "파생상품손익", "외환손익 합계"],
+        primary_ytitle="원",
+    )
+
     ws.cell(row=row, column=1, value="L. 주가 연동 지표 (KRX 종가 기준)").font = LABEL
     row += 1
     if not stock_code:
         ws.cell(row=row, column=1, value="※ 종목코드가 없어 주가 지표를 건너뜁니다.").font = NOTE
         row += 2
     else:
-        ph = row
-        headers = ["연도", "기준일(종가)", "종가", "시가총액", "PER", "PBR", "PSR"]
-        for j, h in enumerate(headers):
-            ws.cell(row=ph, column=1 + j, value=h)
-        style_header(ws, ph, len(headers))
-        row += 1
-        any_price = False
+        write_period_header()
+
+        # 연도별로 한 번만 조회해두고, 아래에서 행(지표)×열(연도)로 펼쳐 쓴다.
+        price_by_i: list[dict | None] = []
+        mktcap_by_i: list[float | None] = []
         for i, year in enumerate(year_list):
             price = load_price(stock_code, f"{year}1231")
-            ws.cell(row=row, column=1, value=y_period_labels[i])
-            if not price:
-                ws.cell(row=row, column=2, value="(가격 데이터 없음 — fetch_stock_price.py 미실행)").font = NOTE
-                row += 1
-                continue
-            any_price = True
-            close = _fmt_num(price.get("close_price"))
-            listed = _fmt_num(price.get("listed_shares"))
-            mktcap = _fmt_num(price.get("market_cap")) or (close * listed if close and listed else None)
-            ws.cell(row=row, column=2, value=price.get("used_date"))
-            if close is not None:
-                ws.cell(row=row, column=3, value=close).number_format = "#,##0"
-            if mktcap is not None:
-                ws.cell(row=row, column=4, value=mktcap).number_format = "#,##0"
-                net_income_ref = ind_ref("당기순이익", i)
-                equity_ref = ind_ref("자본총계", i)
-                revenue_ref = ind_ref("매출액", i)
-                if net_income_ref:
-                    ws.cell(row=row, column=5, value=f"=IFERROR({mktcap}/{net_income_ref},NA())").number_format = "0.0"
-                if equity_ref:
-                    ws.cell(row=row, column=6, value=f"=IFERROR({mktcap}/{equity_ref},NA())").number_format = "0.00"
-                if revenue_ref:
-                    ws.cell(row=row, column=7, value=f"=IFERROR({mktcap}/{revenue_ref},NA())").number_format = "0.00"
-            row += 1
+            price_by_i.append(price)
+            if price:
+                close = _fmt_num(price.get("close_price"))
+                listed = _fmt_num(price.get("listed_shares"))
+                mktcap = _fmt_num(price.get("market_cap")) or (close * listed if close and listed else None)
+            else:
+                mktcap = None
+            mktcap_by_i.append(mktcap)
+
+        write_ratio_row(
+            "기준일(종가)",
+            lambda i: (price_by_i[i] or {}).get("used_date") or "",
+            fmt="General",
+        )
+        write_ratio_row(
+            "종가",
+            lambda i: _fmt_num((price_by_i[i] or {}).get("close_price")),
+            fmt="#,##0",
+        )
+        write_ratio_row(
+            "시가총액",
+            lambda i: mktcap_by_i[i],
+            fmt="#,##0",
+        )
+        write_ratio_row(
+            "PER(배)",
+            lambda i: f"=IFERROR({mktcap_by_i[i]}/{ind_ref('당기순이익', i)},NA())"
+            if mktcap_by_i[i] is not None and ind_ref("당기순이익", i) else "",
+            fmt="0.0",
+        )
+        write_ratio_row(
+            "PBR(배)",
+            lambda i: f"=IFERROR({mktcap_by_i[i]}/{ind_ref('자본총계', i)},NA())"
+            if mktcap_by_i[i] is not None and ind_ref("자본총계", i) else "",
+            fmt="0.00",
+        )
+        write_ratio_row(
+            "PSR(배)",
+            lambda i: f"=IFERROR({mktcap_by_i[i]}/{ind_ref('매출액', i)},NA())"
+            if mktcap_by_i[i] is not None and ind_ref("매출액", i) else "",
+            fmt="0.00",
+        )
+        any_price = any(price_by_i)
         if not any_price:
             ws.cell(row=row, column=1, value=(
                 "※ 이 회사의 가격 캐시가 하나도 없습니다. "
@@ -1319,6 +1484,13 @@ def build_investment_analysis_sheet(
         row += 1
 
     # --- G. 배당 · 대주주 · 자기주식 (DART 추가 공시) ---
+    if stock_code:
+        add_section_chart(
+            "주가 연동 지표 (PER/PBR/PSR)",
+            ["PER(배)", "PBR(배)", "PSR(배)"],
+            primary_ytitle="배",
+        )
+
     ws.cell(row=row, column=1, value="M. 배당 · 대주주 · 자기주식").font = LABEL
     row += 1
     latest_year = year_list[-1] if year_list else None
@@ -1437,7 +1609,8 @@ def main() -> None:
         y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
             wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
         )
-        build_chart_sheet(wb, "연간", y_ind_sheet, y_row_of, len(y_labels))
+        # 차트_연간 별도 시트를 만들지 않고, 지표_연간 시트 I열부터 차트를 임베드한다.
+        build_chart_sheet(wb, "연간", y_ind_sheet, y_row_of, len(y_labels), embed_anchor_col="I")
         if y_missing:
             all_missing["연간"] = y_missing
 
@@ -1452,7 +1625,7 @@ def main() -> None:
     desired_order = [
         "분기_재무제표", "연간_재무제표",
         "지표_분기", "차트_분기",
-        "지표_연간", "차트_연간",
+        "지표_연간",
         "투자분석",
         "원본데이터",
     ]
