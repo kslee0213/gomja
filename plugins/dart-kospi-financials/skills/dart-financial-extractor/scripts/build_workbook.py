@@ -416,8 +416,14 @@ def resolve_metric(
 ) -> tuple[str, str] | None:
     """METRIC_RULES에 따라 (sj_div, account_id)를 찾아 반환한다. 못 찾으면 None."""
     sj_div, exact_candidates, substr_keywords, excludes = METRIC_RULES[key]
+    # 손익 계정(sj_div="IS")은 회사에 따라 별도 손익계산서 없이 포괄손익계산서(CIS)
+    # 하나로만 공시하는 경우가 있다(예: HD한국조선해양). 이 경우 매출액·영업이익·
+    # 당기순이익 등도 sj_div="CIS"로 잡히므로, IS를 찾을 때는 CIS도 함께 후보에 넣는다.
+    # (BS/CF는 이런 혼선이 없어 그대로 둔다. IS/CIS가 둘 다 있는 회사는 SJ_ORDER 순서상
+    # IS 계정이 먼저 삽입되어 있어 그대로 IS가 우선 매칭된다.)
+    candidate_sj = ("IS", "CIS") if sj_div == "IS" else (sj_div,)
     same_sj = [
-        (sj, aid) for (sj, aid) in account_row_map if sj == sj_div
+        (sj, aid) for (sj, aid) in account_row_map if sj in candidate_sj
     ]
 
     def excluded(name: str) -> bool:
