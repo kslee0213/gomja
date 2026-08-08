@@ -901,15 +901,22 @@ def build_investment_analysis_sheet(
         secondary_names: list[str] | None = None,
         primary_ytitle: str = "",
         secondary_ytitle: str = "",
+        primary_type: str = "bar",
     ):
-        """b_row에 등록된 행 이름들을 계열로 하는 막대그래프를 투자분석 시트
+        """b_row에 등록된 행 이름들을 계열로 하는 차트를 투자분석 시트
         오른쪽(N열부터)에 세로로 쌓아 추가한다. secondary_names가 있으면
-        보조축이 있는 콤보 막대그래프로 만든다."""
+        보조축이 있는 콤보 차트로 만든다 — 1차는 막대, 보조축은 항상 꺾은선으로
+        그린다(막대+막대 조합은 Excel에서 축이 뒤바뀌거나 겹치는 문제가 있어
+        openpyxl 공식 예제와 동일한 막대+꺾은선 조합만 쓴다). primary_type="line"이면
+        보조축 없이 1차 계열 전체를 꺾은선으로 그린다."""
         # 카테고리(연도)는 B섹션 표 헤더 행(ratio_header, 연도 라벨이 있는 행)을 공용으로 쓴다.
         cat_ref = Reference(ws, min_col=3, max_col=2 + n, min_row=ratio_header, max_row=ratio_header)
-        chart = BarChart()
-        chart.type = "col"
-        chart.grouping = "clustered"
+        if primary_type == "line":
+            chart = LineChart()
+        else:
+            chart = BarChart()
+            chart.type = "col"
+            chart.grouping = "clustered"
         chart.title = title
         chart.style = 10
         chart.y_axis.title = primary_ytitle
@@ -925,9 +932,7 @@ def build_investment_analysis_sheet(
         chart.set_categories(cat_ref)
 
         if secondary_names:
-            chart2 = BarChart()
-            chart2.type = "col"
-            chart2.grouping = "clustered"
+            chart2 = LineChart()
             for name in secondary_names:
                 r = b_row.get(name)
                 if not r:
@@ -938,8 +943,8 @@ def build_investment_analysis_sheet(
             chart2.y_axis.axId = 200
             chart2.y_axis.title = secondary_ytitle
             chart2.y_axis.axPos = "r"
-            # openpyxl 공식 콤보 차트 패턴: 1차 축이 보조축의 최댓값 쪽에서
-            # 교차하도록 지정해야 Excel에서 보조축이 오른쪽에 분리되어 나온다.
+            # openpyxl 공식 콤보 차트 패턴(막대+꺾은선): 1차 축이 보조축의 최댓값
+            # 쪽에서 교차하도록 지정해야 Excel에서 보조축이 오른쪽에 분리되어 나온다.
             chart.y_axis.crosses = "max"
             chart += chart2
 
@@ -1314,9 +1319,9 @@ def build_investment_analysis_sheet(
     # --- I. ROIC / NOPLAT (간이 버전) ---
     add_section_chart(
         "DuPont 분해 (ROE)",
-        ["ROE 검증 (순이익률×회전율×레버리지, %)"],
         ["레버리지 (자산/자기자본, 배)"],
-        primary_ytitle="%", secondary_ytitle="배",
+        ["ROE 검증 (순이익률×회전율×레버리지, %)"],
+        primary_ytitle="배", secondary_ytitle="%",
     )
 
     ws.cell(row=row, column=1, value="I. ROIC / NOPLAT (간이 계산)").font = LABEL
@@ -1489,6 +1494,7 @@ def build_investment_analysis_sheet(
             "주가 연동 지표 (PER/PBR/PSR)",
             ["PER(배)", "PBR(배)", "PSR(배)"],
             primary_ytitle="배",
+            primary_type="line",
         )
 
     ws.cell(row=row, column=1, value="M. 배당 · 대주주 · 자기주식").font = LABEL
