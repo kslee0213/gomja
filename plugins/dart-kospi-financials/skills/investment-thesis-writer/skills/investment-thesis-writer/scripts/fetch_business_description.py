@@ -1,312 +1,173 @@
 """
-"투자판단 종합" 시트를 만든다. 사용자가 첨부한 "성공투자노트" 양식의 셀 배치를
-그대로 재현한다(회사명/종목코드, 산업분석·판매과정·경쟁우위·생산과정·제품분석·
-리스크·예측가능기간·성장성예측·경쟁상황·수익성예측 텍스트 박스 + 장기(과거+예측)
-재무추세 표 + 최종결론).
+DART "공시서류원본파일" API로 최신 사업보고서 원문을 내려받아, "II. 사업의 내용"
+섹션 텍스트만 추출해 캐시에 저장한다.
 
-이 스크립트는 정성적 텍스트나 성장률 가정을 스스로 만들어내지 않는다 — 그건
-Claude가 DART 사업의 내용 + 웹 리서치 + 기존 투자분석 결과를 종합해 작성한 뒤
-JSON 파일로 넘겨줘야 한다. 이 스크립트는 그 JSON을 받아 정해진 레이아웃에
-꽂아 넣고, 과거 실적은 이미 만들어진 "지표_연간" 시트를 참조하는 수식으로,
-예측 구간은 Claude가 제시한 성장률 가정을 compounding하는 수식으로 채운다
-(둘 다 감사 가능하도록 하드코딩 값이 아니라 수식으로 남긴다).
+다른 스크립트들과 달리 이 데이터는 깔끔한 JSON 필드가 아니라 사업보고서 전체
+문서(XML)에서 텍스트를 긁어내는 방식이라, 회사마다 문서 구조가 조금씩 달라
+완벽하게 정제되지 않을 수 있다. 그래서 이 스크립트는 "완벽한 파싱"을 목표로
+하지 않고, Claude가 읽고 요약할 수 있는 수준의 원문 텍스트 블록을 뽑아내는
+것을 목표로 한다.
+
+절차:
+    1. list.json (공시검색)으로 최신 사업보고서의 접수번호(rcept_no)를 찾는다.
+    2. document.xml (공시서류원본파일)로 그 보고서의 원문 ZIP을 받는다.
+    3. ZIP 안의 XML에서 "사업의 내용" 또는 "II. 사업의 내용" 제목 이후 ~
+       다음 대제목(로마숫자, 보통 "III.") 이전까지의 텍스트를 뽑는다.
 
 사용법:
-    python build_thesis_sheet.py <기존 투자분석 xlsx 경로> <content.json 경로>
+    python fetch_business_description.py --api-key <DART_API_KEY> <corp_code>
 
-content.json 스키마는 이 파일 하단 CONTENT_SCHEMA_EXAMPLE 참고.
+캐시 위치: cache/bizdesc_{corp_code}.json
+    {"corp_name":..., "rcept_no":..., "rcept_dt":..., "text": "...", "truncated": bool}
 """
 import argparse
+import io
 import json
+import re
 import sys
+import zipfile
 from pathlib import Path
 
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+import requests
 
-FONT_NAME = "맑은 고딕"
-TITLE_FONT = Font(name=FONT_NAME, bold=True, size=16)
-SECTION_FONT = Font(name=FONT_NAME, bold=True, size=11, color="FFFFFF")
-SECTION_FILL = PatternFill("solid", fgColor="2F5597")
-BODY_FONT = Font(name=FONT_NAME, size=10)
-WRAP = Alignment(wrap_text=True, vertical="top", horizontal="left")
-NOTE_FONT = Font(name=FONT_NAME, italic=True, size=9, color="808080")
+BASE_URL = "https://opendart.fss.or.kr/api"
+SCRIPT_DIR = Path(__file__).resolve().parent
+CACHE_DIR = SCRIPT_DIR.parent / "cache"
 
-CONTENT_SCHEMA_EXAMPLE = {
-    "company_name": "회사명",
-    "stock_code": "005930",
-    "industry_analysis": "산업 분석 텍스트",
-    "sales_process": "판매 과정 텍스트",
-    "competitive_advantage": "경쟁 우위 텍스트",
-    "production_process": "생산 과정 텍스트",
-    "production_process_extra": "생산/설비투자 관련 보충 텍스트(선택)",
-    "products": [
-        {"name": "제품1", "description": "제품1 설명"},
-        {"name": "제품2", "description": "제품2 설명"},
-    ],
-    "risk": "리스크 텍스트",
-    "predictable_period_text": "예측 가능 기간 텍스트",
-    "growth_prediction_text": "성장성 예측 텍스트",
-    "competitive_situation": "경쟁 상황(시장점유율 등) 텍스트",
-    "profitability_prediction_text": "수익성 예측 텍스트",
-    "final_conclusion_text": "최종 결론 텍스트",
-    "sustainable_period_years": 10,
-    "expected_annual_return_pct": 15.6,
-    "projection_years": 10,
-    "revenue_growth_assumptions": [0.10] * 10,
-    "op_margin_assumptions": [0.11] * 10,
-    "net_margin_assumptions": [0.10] * 10,
-    "sources": ["웹 리서치에 사용한 출처 URL들(선택, 각주용)"],
-}
+# Claude가 읽고 요약하기에 충분하면서도 대화 컨텍스트를 과도하게 잡아먹지
+# 않도록 텍스트 길이를 제한한다. 필요하면 사용자가 스크립트 인자로 늘릴 수 있다.
+DEFAULT_MAX_CHARS = 12000
 
 
-def find_year_row(ws, label: str) -> int | None:
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=2, max_col=2):
-        if row[0].value == label:
-            return row[0].row
+def get_api_key(cli_key: str | None) -> str:
+    key = cli_key or __import__("os").environ.get("DART_API_KEY")
+    if not key:
+        print("ERROR: API 키가 없습니다. --api-key 인자로 전달하세요.", file=sys.stderr)
+        sys.exit(1)
+    return key
+
+
+def find_latest_annual_report(api_key: str, corp_code: str) -> dict | None:
+    """list.json으로 가장 최근 사업보고서(정기공시, 사업보고서 유형)의 접수번호를 찾는다."""
+    resp = requests.get(
+        f"{BASE_URL}/list.json",
+        params={
+            "crtfc_key": api_key,
+            "corp_code": corp_code,
+            "pblntf_ty": "A",  # 정기공시
+            "page_count": 20,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "000":
+        return None
+    for item in data.get("list", []):
+        # report_nm 예: "사업보고서 (2023.12)" — "사업보고서"로 시작하는 것만 (반기/분기 제외)
+        if str(item.get("report_nm", "")).strip().startswith("사업보고서"):
+            return item
     return None
 
 
-def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = None) -> str:
-    wb = load_workbook(src_path)
-    if "투자분석" not in wb.sheetnames:
-        print("ERROR: 원본 파일에 '투자분석' 시트가 없습니다. 먼저 build_workbook.py로 만드세요.", file=sys.stderr)
-        sys.exit(1)
-    ind_sheet = wb["지표_연간"] if "지표_연간" in wb.sheetnames else None
-    if ind_sheet is None:
-        print("ERROR: 원본 파일에 '지표_연간' 시트가 없습니다(연간 데이터 필요).", file=sys.stderr)
-        sys.exit(1)
+def fetch_document_zip(api_key: str, rcept_no: str) -> bytes:
+    resp = requests.get(
+        f"{BASE_URL}/document.xml",
+        params={"crtfc_key": api_key, "rcept_no": rcept_no},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.content
 
-    content = json.loads(Path(content_path).read_text(encoding="utf-8"))
 
-    if "투자판단 종합" in wb.sheetnames:
-        del wb["투자판단 종합"]
-    ws = wb.create_sheet("투자판단 종합")
-    ws.sheet_view.showGridLines = False
+def strip_xml_tags(raw: str) -> str:
+    # 표(TABLE) 안 셀 구분을 공백으로 살려두고 태그만 제거한다.
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
 
-    # --- 상단: 회사명 / 종목코드 ---
-    ws["B2"] = content.get("company_name", "")
-    ws["B2"].font = TITLE_FONT
-    ws["D2"] = content.get("stock_code", "")
-    ws["D2"].font = Font(name=FONT_NAME, size=12)
 
-    def section(header_cell: str, header_merge: str, header_text: str,
-                body_cell: str, body_merge: str, body_text: str):
-        ws.merge_cells(header_merge)
-        hc = ws[header_cell]
-        hc.value = header_text
-        hc.font = SECTION_FONT
-        hc.fill = SECTION_FILL
-        hc.alignment = Alignment(horizontal="center", vertical="center")
-        ws.merge_cells(body_merge)
-        bc = ws[body_cell]
-        bc.value = body_text or "(내용 없음)"
-        bc.font = BODY_FONT
-        bc.alignment = WRAP
-
-    section("B4", "B4:C4", "산업 분석", "B5", "B5:O10", content.get("industry_analysis", ""))
-    section("Q4", "Q4:R4", "판매 과정", "Q5", "Q5:T37", content.get("sales_process", ""))
-    section("V4", "V4:W4", "경쟁 우위", "V5", "V5:AC15", content.get("competitive_advantage", ""))
-    section("B12", "B12:C12", "생산 과정", "B13", "B13:H21", content.get("production_process", ""))
-
-    ws.merge_cells("I12:J12")
-    ws["I12"] = "제품 분석"
-    ws["I12"].font = SECTION_FONT
-    ws["I12"].fill = SECTION_FILL
-    ws["I12"].alignment = Alignment(horizontal="center", vertical="center")
-
-    products = content.get("products", [])
-    if len(products) > 0:
-        ws.merge_cells("L12:O20")
-        ws["L12"] = products[0].get("description", "")
-        ws["L12"].font = BODY_FONT
-        ws["L12"].alignment = WRAP
-        ws.merge_cells("I14:K14")
-        ws["I14"] = products[0].get("name", "")
-        ws["I14"].font = Font(name=FONT_NAME, bold=True)
-    if len(products) > 1:
-        ws.merge_cells("L21:O29")
-        ws["L21"] = products[1].get("description", "")
-        ws["L21"].font = BODY_FONT
-        ws["L21"].alignment = WRAP
-        ws.merge_cells("I22:K22")
-        ws["I22"] = products[1].get("name", "")
-        ws["I22"].font = Font(name=FONT_NAME, bold=True)
-
-    if content.get("production_process_extra"):
-        ws.merge_cells("B22:H29")
-        ws["B22"] = content["production_process_extra"]
-        ws["B22"].font = BODY_FONT
-        ws["B22"].alignment = WRAP
-
-    section("V16", "V16:W16", "리스크", "V17", "V17:AC27", content.get("risk", ""))
-    section("V28", "V28:X28", "예측 가능 기간", "V29", "V29:Y43", content.get("predictable_period_text", ""))
-    section("Z28", "Z28:AB28", "성장성 예측", "Z29", "Z29:AC35", content.get("growth_prediction_text", ""))
-    section("B31", "B31:C31", "경쟁 상황", "B32", "B32:O37", content.get("competitive_situation", ""))
-    section("Z36", "Z36:AB36", "수익성 예측", "Z37", "Z37:AC43", content.get("profitability_prediction_text", ""))
-
-    # --- 최종 결론 ---
-    ws.merge_cells("V44:W44")
-    ws["V44"] = "최종 결론"
-    ws["V44"].font = SECTION_FONT
-    ws["V44"].fill = SECTION_FILL
-    ws["V44"].alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.merge_cells("V45:X45")
-    ws["V45"] = "지속 가능 기간"
-    ws["V45"].font = Font(name=FONT_NAME, bold=True)
-    ws["Y45"] = content.get("sustainable_period_years")
-    ws["Z45"] = "년"
-
-    ws.merge_cells("V46:X46")
-    ws["V46"] = "연평균 예상 수익률"
-    ws["V46"].font = Font(name=FONT_NAME, bold=True)
-    ret = content.get("expected_annual_return_pct")
-    ws["Y46"] = (ret / 100) if ret is not None else None
-    ws["Y46"].number_format = "0.0%"
-
-    ws.merge_cells("V47:AC55")
-    ws["V47"] = content.get("final_conclusion_text", "")
-    ws["V47"].font = BODY_FONT
-    ws["V47"].alignment = WRAP
-
-    # --- 장기 재무추세 표: 과거(지표_연간 참조 수식) + 예측(가정 성장률 compounding 수식) ---
-    # 지표_연간 시트의 헤더 행(연도)과 각 지표 행 위치를 찾는다.
-    header_row = None
-    for r in range(1, 5):
-        if ind_sheet.cell(row=r, column=1).value == "지표":
-            header_row = r
-            break
-    if header_row is None:
-        print("ERROR: '지표_연간' 시트 구조를 인식하지 못했습니다.", file=sys.stderr)
-        sys.exit(1)
-
-    hist_years = []
-    col = 3
-    while ind_sheet.cell(row=header_row, column=col).value not in (None, ""):
-        hist_years.append((col, ind_sheet.cell(row=header_row, column=col).value))
-        col += 1
-    n_hist = len(hist_years)
-
-    proj_years_n = int(content.get("projection_years", 10))
-    last_year = int(hist_years[-1][1]) if hist_years else None
-    proj_years = [last_year + i for i in range(1, proj_years_n + 1)] if last_year else []
-
-    row_map = {
-        "매출액": find_year_row(ind_sheet, "매출액"),
-        "영업이익": find_year_row(ind_sheet, "영업이익"),
-        "당기순이익": find_year_row(ind_sheet, "당기순이익"),
-        "자산총계": find_year_row(ind_sheet, "자산총계"),
-        "부채총계": find_year_row(ind_sheet, "부채총계"),
-        "자본총계": find_year_row(ind_sheet, "자본총계"),
-    }
-
-    TABLE_START_COL = 4  # D열부터
-    year_row = 39
-    idx_row = 38
-    ws.cell(row=idx_row, column=2, value="연차")
-    for i, _ in enumerate(hist_years + [(None, y) for y in proj_years]):
-        c = TABLE_START_COL + i
-        ws.cell(row=idx_row, column=c, value=i + 1)
-    ws.cell(row=year_row, column=2, value="연도")
-    all_years = [y for _, y in hist_years] + proj_years
-    for i, y in enumerate(all_years):
-        ws.cell(row=year_row, column=TABLE_START_COL + i, value=int(y))
-
-    labels = [
-        ("매출액", 44), ("Growth", 45), ("영업이익", 46), ("영업이익률", 47), ("Growth", 48),
-        ("순이익", 49), ("순이익률", 50), ("Growth", 51), ("ROE", 52),
-        ("자산", 53), ("부채", 54), ("자본", 55),
-    ]
-    for name, r in labels:
-        ws.cell(row=r, column=2, value=name)
-
-    rev_g = content.get("revenue_growth_assumptions", [0.1] * proj_years_n)
-    op_m = content.get("op_margin_assumptions", [0.1] * proj_years_n)
-    net_m = content.get("net_margin_assumptions", [0.1] * proj_years_n)
-
-    for i in range(len(all_years)):
-        col_letter = get_column_letter(TABLE_START_COL + i)
-        is_hist = i < n_hist
-
-        if is_hist:
-            src_col = get_column_letter(hist_years[i][0])
-            if row_map["매출액"]:
-                ws[f"{col_letter}44"] = f"='지표_연간'!{src_col}{row_map['매출액']}"
-            if row_map["영업이익"]:
-                ws[f"{col_letter}46"] = f"='지표_연간'!{src_col}{row_map['영업이익']}"
-            if row_map["당기순이익"]:
-                ws[f"{col_letter}49"] = f"='지표_연간'!{src_col}{row_map['당기순이익']}"
-            if row_map["자산총계"]:
-                ws[f"{col_letter}53"] = f"='지표_연간'!{src_col}{row_map['자산총계']}"
-            if row_map["부채총계"]:
-                ws[f"{col_letter}54"] = f"='지표_연간'!{src_col}{row_map['부채총계']}"
-            if row_map["자본총계"]:
-                ws[f"{col_letter}55"] = f"='지표_연간'!{src_col}{row_map['자본총계']}"
-            ws[f"{col_letter}47"] = f"=IFERROR({col_letter}46/{col_letter}44,\"\")"
-            ws[f"{col_letter}50"] = f"=IFERROR({col_letter}49/{col_letter}44,\"\")"
-            ws[f"{col_letter}52"] = f"=IFERROR({col_letter}49/{col_letter}55,\"\")"
-        else:
-            p = i - n_hist
-            prev_col = get_column_letter(TABLE_START_COL + i - 1)
-            g = rev_g[p] if p < len(rev_g) else rev_g[-1] if rev_g else 0.1
-            om = op_m[p] if p < len(op_m) else op_m[-1] if op_m else 0.1
-            nm = net_m[p] if p < len(net_m) else net_m[-1] if net_m else 0.1
-            ws[f"{col_letter}44"] = f"={prev_col}44*(1+{g})"
-            ws[f"{col_letter}45"] = g
-            ws[f"{col_letter}46"] = f"={col_letter}44*{om}"
-            ws[f"{col_letter}47"] = om
-            ws[f"{col_letter}49"] = f"={col_letter}44*{nm}"
-            ws[f"{col_letter}50"] = nm
-            # 자산/부채/자본은 단순화: 자본은 전기 자본+당기순이익(배당 가정 없이 전액 유보) 누적, 부채는 전기와 동일 유지, 자산=부채+자본
-            ws[f"{col_letter}55"] = f"={prev_col}55+{col_letter}49"
-            ws[f"{col_letter}54"] = f"={prev_col}54"
-            ws[f"{col_letter}53"] = f"={col_letter}54+{col_letter}55"
-            ws[f"{col_letter}52"] = f"=IFERROR({col_letter}49/{col_letter}55,\"\")"
-
-        for r in (44, 46, 49, 53, 54, 55):
-            ws.cell(row=r, column=TABLE_START_COL + i).number_format = "#,##0"
-        for r in (45, 47, 48, 50, 51, 52):
-            ws.cell(row=r, column=TABLE_START_COL + i).number_format = "0.0%"
-
-    ws.cell(row=len(all_years) + 57, column=2, value=(
-        "※ 굵게 표시되지 않은 연도(마지막 실적연도 이후)는 사용자/Claude가 제시한 성장률 가정에 따른 추정치입니다. "
-        "실적이 아니라 시나리오이므로 투자 판단 시 가정을 직접 검토하세요."
-    )).font = NOTE_FONT
-
-    ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 14
-    for col in range(3, 30):
-        ws.column_dimensions[get_column_letter(col)].width = 11
-
-    if outdir is None:
-        # 기본 동작(v0.9.1부터): 새 파일을 만들지 않고 원본 파일 그대로 덮어써서
-        # "재무제표+투자분석+투자판단 종합"이 전부 한 파일에 담기게 한다.
-        outfile = Path(src_path)
-    else:
-        today = __import__("datetime").date.today().strftime("%Y%m%d")
-        outdir_path = Path(outdir)
-        outdir_path.mkdir(parents=True, exist_ok=True)
-        outfile = outdir_path / f"{content.get('company_name','기업')}_투자판단종합_{today}.xlsx"
-    wb.save(outfile)
-    return str(outfile)
+def extract_business_section(full_text: str) -> str | None:
+    """"II. 사업의 내용" 제목부터 다음 로마숫자 대제목("III." 등) 전까지 추출한다."""
+    # 문서마다 "사업의 내용", "II. 사업의 내용", "2. 사업의 내용" 등 표기가 다를 수 있다.
+    start_pat = re.compile(r"(사업의\s*내용)")
+    m_start = start_pat.search(full_text)
+    if not m_start:
+        return None
+    tail = full_text[m_start.start():]
+    # 다음 대제목(보통 "III. 재무에 관한 사항" 류) 앞까지만 자른다.
+    end_pat = re.compile(r"(III\s*\.\s*재무|3\s*\.\s*재무에\s*관한|재무에\s*관한\s*사항)")
+    m_end = end_pat.search(tail[50:])  # 자기 자신 근처 오탐 방지로 조금 건너뛰고 탐색
+    if m_end:
+        tail = tail[: 50 + m_end.start()]
+    return tail.strip()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("src_xlsx", help="기존 투자분석 포함 xlsx 경로 (예: 연간 파일)")
-    ap.add_argument("content_json", help="정성 콘텐츠 JSON 파일 경로")
-    ap.add_argument(
-        "--outdir", default=None,
-        help="지정하면 새 파일(...''_투자판단종합_'YYYYMMDD.xlsx)로 따로 저장한다. "
-             "지정하지 않으면(기본값) src_xlsx 파일 자체에 시트를 추가해 덮어쓴다 "
-             "— 재무제표+투자분석+투자판단 종합이 파일 하나로 합쳐진다.",
-    )
+    ap.add_argument("corp_code")
+    ap.add_argument("--api-key", required=True)
+    ap.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     args = ap.parse_args()
 
-    outfile = build_thesis_sheet(args.src_xlsx, args.content_json, args.outdir)
-    print(json.dumps({"saved": outfile}, ensure_ascii=False))
+    report = find_latest_annual_report(args.api_key, args.corp_code)
+    if not report:
+        print(f"ERROR: {args.corp_code}의 사업보고서를 찾지 못했습니다.", file=sys.stderr)
+        sys.exit(1)
+
+    rcept_no = report["rcept_no"]
+    try:
+        zip_bytes = fetch_document_zip(args.api_key, rcept_no)
+    except requests.RequestException as e:
+        print(f"ERROR: 원문 다운로드 실패: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    combined_text = ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith((".xml", ".htm", ".html")):
+                    continue
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+                text = strip_xml_tags(raw)
+                section = extract_business_section(text)
+                if section:
+                    combined_text = section
+                    break
+    except zipfile.BadZipFile:
+        print("ERROR: 응답이 ZIP 형식이 아닙니다(인증키/접수번호 확인 필요).", file=sys.stderr)
+        sys.exit(1)
+
+    if not combined_text:
+        print(
+            "WARNING: '사업의 내용' 섹션을 자동으로 찾지 못했습니다. "
+            "빈 텍스트로 저장하니, 필요하면 DART 사이트에서 직접 확인하세요.",
+            file=sys.stderr,
+        )
+
+    truncated = len(combined_text) > args.max_chars
+    if truncated:
+        combined_text = combined_text[: args.max_chars]
+
+    result = {
+        "corp_code": args.corp_code,
+        "rcept_no": rcept_no,
+        "rcept_dt": report.get("rcept_dt"),
+        "report_nm": report.get("report_nm"),
+        "text": combined_text,
+        "truncated": truncated,
+    }
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / f"bizdesc_{args.corp_code}.json"
+    cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(
+        {"saved": str(cache_path), "rcept_no": rcept_no, "text_length": len(combined_text), "truncated": truncated},
+        ensure_ascii=False,
+    ))
 
 
 if __name__ == "__main__":
