@@ -9,9 +9,14 @@ description: >
   "투자분석" sheet results into a one-page narrative investment thesis
   (industry analysis, sales/production process, competitive advantage, risk,
   predictable period, growth/profitability forecast, and final conclusion with
-  a target holding period and expected annual return).
+  a target holding period and expected annual return). Also use for
+  value-investing valuation requests such as "OO 내재가치 계산해줘",
+  "OO DCF 해줘", "OO 안전마진 확인해줘", "OO 오너어닝 계산해줘",
+  "OO 해자 분석해줘" — these add a "버핏멍거_가치평가" sheet to the same workbook
+  (오너 어닝, 그레이엄 내재가치·안전마진, 시장 내재 기대성장률 역산, ROIC vs WACC,
+  다년도 DCF 내재가치 계산기, 경제적 해자 체크리스트).
 metadata:
-  version: "1.2.0"
+  version: "1.4.0"
 ---
 
 # 투자판단 종합 시트 작성
@@ -94,7 +99,51 @@ python skills/investment-thesis-writer/scripts/build_thesis_sheet.py <원본_연
 - 장기 재무추세 표는 과거 실적(최근 5개년, `지표_연간` 시트를 참조하는 수식이라 감사 가능) + 예측 구간(제시한 성장률 가정을 복리 계산하는 수식)으로 자동 구성된다. 하드코딩된 숫자가 아니라 전부 수식이므로, 사용자가 엑셀에서 가정치 셀만 바꾸면 전체 표가 다시 계산된다.
 - 완료 후 사용자에게: (1) 어떤 웹 검색으로 리서치했는지 출처 요약, (2) 성장률 가정의 근거, (3) DART 사업의 내용 파싱이 잘 안 됐다면 그 사실을 알려준다.
 
+## 6. "버핏멍거_가치평가" 시트 (v1.4.0부터)
+
+첨부 참고자료("워렌버핏과 찰리멍거")의 계산들을 코드화한 **세 번째 시트**다. `투자판단 종합`이 완성된 뒤(또는 없어도 "투자분석" 시트만 있으면) 이어서 만들 수 있다. 5번 섹션과 마찬가지로 순수 계산은 전부 수식으로 채워지지만, 할인율·영구성장률·WACC·향후 오너 어닝 성장률 가정·해자 체크리스트 평가·종합 결론은 Claude가 판단해서 채워야 한다.
+
+### 사전 준비
+
+`skills/dart-financial-extractor/scripts/build_workbook.py`가 이미 "감가상각비" 계정을 "투자분석" 시트의 기초 참고값으로 채워두므로(v0.9.7부터), 별도 데이터 수집 없이 바로 진행할 수 있다. 다만 "투자분석" 시트가 오래된 버전(v0.9.6 이전)으로 만들어진 파일이면 감가상각비가 없어 오너 어닝 행이 비게 되니, 이 경우 사용자에게 최신 버전으로 재생성을 안내한다.
+
+### content.json 작성
+
+`skills/investment-thesis-writer/scripts/build_valuation_sheet.py`의 `CONTENT_SCHEMA_EXAMPLE` 참고. 핵심 필드:
+
+- `wacc_pct`: 자본비용 가정(%). 베타 데이터가 없으므로 업종 평균(보통 6~10%)을 근거로 Claude가 제시한다.
+- `discount_rate_pct`, `terminal_growth_pct`: DCF 할인율과 영구성장률. 할인율은 보통 WACC와 비슷하거나 약간 높게, 영구성장률은 장기 GDP 성장률(2~4%)을 넘지 않게 잡는다(그래야 TV가 발산하지 않는다).
+- `projection_years`: DCF 예측 기간(보통 5~10년).
+- `owner_earnings_growth_assumptions`: 연도별 오너 어닝 성장률 가정 리스트. 근거 없이 임의로 정하지 말고, "투자분석"의 과거 5개년 성장률과 "투자판단 종합"에서 이미 리서치한 산업 전망을 참고해 정한다.
+- `moat_checklist`: 9개 항목(경쟁우위, 시장점유율, 경영진, 안전마진, 가격전가력, 신뢰성, 규제경험, 규모우위, 네트워크효과) 각각에 평가(강함/보통/약함/- )와 근거를 채운다. "투자판단 종합"에서 이미 리서치한 내용을 재사용하면 된다.
+- `valuation_conclusion`: 안전마진(자산기반·성장주기반·DCF 세 가지가 나온다), ROIC-WACC 스프레드, 해자 체크리스트를 종합한 투자 의견.
+
+### 실행
+
+```
+python skills/investment-thesis-writer/scripts/build_valuation_sheet.py <xlsx 경로> <content.json 경로>
+```
+
+`--outdir`를 지정하지 않으면(기본값) 같은 파일에 "버핏멍거_가치평가" 시트를 추가해 덮어쓴다 — `dart-financial-extractor`의 재무제표+투자분석, 그리고 `투자판단 종합`까지 전부 파일 하나에 모인다.
+
+### 결과 해석 시 유의점
+
+- 세 가지 안전마진(자산기반/성장주기반/DCF)이 서로 다른 값을 낼 수 있다. 이는 정상이며, 세 관점 중 어느 게 이 회사에 더 적합한지(자산이 무거운 회사면 자산기반, 성장주면 성장주기반, 현금흐름이 안정적이면 DCF) Claude가 판단해 종합 결론에 반영한다.
+- DCF의 영구가치(TV)는 할인율과 영구성장률의 차이가 작을수록 급격히 커진다(발산 위험). `discount_rate_pct - terminal_growth_pct`가 3%p 미만이면 TV가 비정상적으로 크게 나올 수 있으므로 가정을 재검토하라고 안내한다.
+- 완료 후 사용자에게: 세 안전마진 수치, ROIC-WACC 스프레드, 해자 체크리스트 요약, 그리고 DCF 가정(할인율·영구성장률·오너어닝 성장률)의 근거를 간단히 알려준다.
+
 ## 참고
+
+### v1.4.0 변경 사항
+
+- **`build_valuation_sheet.py` 신규 추가**: "버핏멍거_가치평가" 시트(6번 섹션 참고)를 만든다. 오너 어닝, 그레이엄 내재가치·안전마진, 시장 내재 기대성장률 역산, ROIC vs WACC, 다년도 DCF, 해자 체크리스트를 계산한다.
+- 단위 버그 2건을 실제로 테스트 중 발견해 수정함: (1) "상장주식수 역산" 계산에서 시가총액이 억원 단위인데 원 단위 종가와 그대로 나눠서 실제 주식수보다 1억분의 1로 작게 나오던 문제, (2) "시장 내재 기대성장률 = (PER−8.5)/2" 값이 이미 %포인트 단위인데 셀 서식을 %로 지정해서 100배로 표시되고, 그 값을 그대로 "실제 CAGR"(분수 단위)과 빼서 "괴리"를 계산해 단위가 안 맞던 문제. 두 값 모두 실제 계산해서 손으로 검산한 뒤 확인했다.
+
+### v1.3.0 변경 사항
+
+- **제품 분석 정렬**: 제품명(I열)과 설명(L열)이 같은 행에 오도록 수정(I13+L13, I21+L21). 예전엔 이름이 설명보다 아래 행에 떨어져 있었다.
+- **재무추세표**: "연도"가 "연차"보다 먼저 나오도록 순서를 바꾸고, 표 시작 열을 D→C로 한 칸 당겼다. 시가총액·주가·PER·PBR 4행은 같은 워크북의 "투자분석" 시트 L섹션을 셀 참조 수식으로 채운다(과거 실적 연도만, 예측 구간은 미래 주가를 예측하지 않으므로 빈칸 유지).
+- **테두리**: `apply_grid_border`/`apply_grid_border_range` 헬퍼로 모든 텍스트 박스(헤더+본문)와 재무추세표 전체에 얇은 테두리를 적용했다. 새 섹션을 추가할 때는 반드시 `section()` 헬퍼를 통해 만들거나, 직접 만드는 경우 `apply_grid_border_range()`를 꼭 호출해야 테두리가 붙는다.
 
 - 이 스킬은 `dart-financial-extractor`가 만든 파일에 시트를 "추가"하는 것이라 그 스킬과 항상 짝을 이뤄 쓰인다(독립적으로 원본 재무 데이터를 처음부터 수집하지 않는다).
 - 재무 추세 표의 예측 구간은 시나리오이지 사실이 아니다. 시트에도 이 사실을 명시하는 각주가 자동으로 들어가지만, 대화에서도 사용자에게 "추정치"임을 한 번 더 짚어준다.
