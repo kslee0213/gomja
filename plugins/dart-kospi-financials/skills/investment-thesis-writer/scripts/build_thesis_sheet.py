@@ -22,12 +22,27 @@ import sys
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter, range_boundaries
 
 FONT_NAME = "맑은 고딕"
 TITLE_FONT = Font(name=FONT_NAME, bold=True, size=16)
 SECTION_FONT = Font(name=FONT_NAME, bold=True, size=11, color="FFFFFF")
+THIN_SIDE = Side(style="thin", color="000000")
+THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+
+def apply_grid_border(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
+    """지정한 범위의 모든 셀에 얇은 테두리를 그린다."""
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            ws.cell(row=r, column=c).border = THIN_BORDER
+
+
+def apply_grid_border_range(ws, a1_range: str) -> None:
+    """"B5:O10" 같은 A1 범위 문자열에 그대로 테두리를 적용한다."""
+    min_col, min_row, max_col, max_row = range_boundaries(a1_range)
+    apply_grid_border(ws, min_row, max_row, min_col, max_col)
 SECTION_FILL = PatternFill("solid", fgColor="2F5597")
 BODY_FONT = Font(name=FONT_NAME, size=10)
 WRAP = Alignment(wrap_text=True, vertical="top", horizontal="left")
@@ -99,11 +114,13 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         hc.font = SECTION_FONT
         hc.fill = SECTION_FILL
         hc.alignment = Alignment(horizontal="center", vertical="center")
+        apply_grid_border_range(ws, header_merge)
         ws.merge_cells(body_merge)
         bc = ws[body_cell]
         bc.value = body_text or "(내용 없음)"
         bc.font = BODY_FONT
         bc.alignment = WRAP
+        apply_grid_border_range(ws, body_merge)
 
     section("B4", "B4:C4", "산업 분석", "B5", "B5:O10", content.get("industry_analysis", ""))
     section("Q4", "Q4:R4", "판매 과정", "Q5", "Q5:T37", content.get("sales_process", ""))
@@ -115,30 +132,36 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     ws["I12"].font = SECTION_FONT
     ws["I12"].fill = SECTION_FILL
     ws["I12"].alignment = Alignment(horizontal="center", vertical="center")
+    apply_grid_border_range(ws, "I12:J12")
 
     products = content.get("products", [])
     if len(products) > 0:
-        ws.merge_cells("L12:O20")
-        ws["L12"] = products[0].get("description", "")
-        ws["L12"].font = BODY_FONT
-        ws["L12"].alignment = WRAP
-        ws.merge_cells("I14:K14")
-        ws["I14"] = products[0].get("name", "")
-        ws["I14"].font = Font(name=FONT_NAME, bold=True)
+        ws.merge_cells("I13:K13")
+        ws["I13"] = products[0].get("name", "")
+        ws["I13"].font = Font(name=FONT_NAME, bold=True)
+        apply_grid_border_range(ws, "I13:K13")
+        ws.merge_cells("L13:O20")
+        ws["L13"] = products[0].get("description", "")
+        ws["L13"].font = BODY_FONT
+        ws["L13"].alignment = WRAP
+        apply_grid_border_range(ws, "L13:O20")
     if len(products) > 1:
+        ws.merge_cells("I21:K21")
+        ws["I21"] = products[1].get("name", "")
+        ws["I21"].font = Font(name=FONT_NAME, bold=True)
+        apply_grid_border_range(ws, "I21:K21")
         ws.merge_cells("L21:O29")
         ws["L21"] = products[1].get("description", "")
         ws["L21"].font = BODY_FONT
         ws["L21"].alignment = WRAP
-        ws.merge_cells("I22:K22")
-        ws["I22"] = products[1].get("name", "")
-        ws["I22"].font = Font(name=FONT_NAME, bold=True)
+        apply_grid_border_range(ws, "L21:O29")
 
     if content.get("production_process_extra"):
         ws.merge_cells("B22:H29")
         ws["B22"] = content["production_process_extra"]
         ws["B22"].font = BODY_FONT
         ws["B22"].alignment = WRAP
+        apply_grid_border_range(ws, "B22:H29")
 
     section("V16", "V16:W16", "리스크", "V17", "V17:AC27", content.get("risk", ""))
     section("V28", "V28:X28", "예측 가능 기간", "V29", "V29:Y43", content.get("predictable_period_text", ""))
@@ -152,12 +175,14 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     ws["V44"].font = SECTION_FONT
     ws["V44"].fill = SECTION_FILL
     ws["V44"].alignment = Alignment(horizontal="center", vertical="center")
+    apply_grid_border_range(ws, "V44:W44")
 
     ws.merge_cells("V45:X45")
     ws["V45"] = "지속 가능 기간"
     ws["V45"].font = Font(name=FONT_NAME, bold=True)
     ws["Y45"] = content.get("sustainable_period_years")
     ws["Z45"] = "년"
+    apply_grid_border(ws, 45, 45, 22, 26)  # V45:Z45
 
     ws.merge_cells("V46:X46")
     ws["V46"] = "연평균 예상 수익률"
@@ -165,11 +190,13 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     ret = content.get("expected_annual_return_pct")
     ws["Y46"] = (ret / 100) if ret is not None else None
     ws["Y46"].number_format = "0.0%"
+    apply_grid_border(ws, 46, 46, 22, 26)  # V46:Z46
 
     ws.merge_cells("V47:AC55")
     ws["V47"] = content.get("final_conclusion_text", "")
     ws["V47"].font = BODY_FONT
     ws["V47"].alignment = WRAP
+    apply_grid_border_range(ws, "V47:AC55")
 
     # --- 장기 재무추세 표: 과거(지표_연간 참조 수식) + 예측(가정 성장률 compounding 수식) ---
     # 지표_연간 시트의 헤더 행(연도)과 각 지표 행 위치를 찾는다.
@@ -218,18 +245,18 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         "자본총계": find_year_row(ind_sheet, "자본총계"),
     }
 
-    TABLE_START_COL = 4  # D열부터
-    year_row = 39
-    idx_row = 38
-    ws.cell(row=idx_row, column=1, value="(억원)").font = NOTE_FONT
-    ws.cell(row=idx_row, column=2, value="연차")
-    for i, _ in enumerate(hist_years + [(None, y) for y in proj_years]):
-        c = TABLE_START_COL + i
-        ws.cell(row=idx_row, column=c, value=i + 1)
+    TABLE_START_COL = 3  # C열부터 (기존 D열에서 한 칸 당김)
+    idx_row = 39  # 연차 (연도보다 아래)
+    year_row = 38  # 연도 (먼저 나옴)
+    ws.cell(row=year_row, column=1, value="(억원)").font = NOTE_FONT
     ws.cell(row=year_row, column=2, value="연도")
     all_years = [y for _, y in hist_years] + proj_years
     for i, y in enumerate(all_years):
         ws.cell(row=year_row, column=TABLE_START_COL + i, value=int(y))
+    ws.cell(row=idx_row, column=2, value="연차")
+    for i, _ in enumerate(hist_years + [(None, y) for y in proj_years]):
+        c = TABLE_START_COL + i
+        ws.cell(row=idx_row, column=c, value=i + 1)
 
     labels = [
         ("시가총액", 40), ("주가", 41), ("PER", 42), ("PBR", 43),
@@ -314,6 +341,8 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
             ws.cell(row=r, column=TABLE_START_COL + i).number_format = "#,##0.0"
         for r in (45, 47, 48, 50, 51, 52):
             ws.cell(row=r, column=TABLE_START_COL + i).number_format = "0.0%"
+
+    apply_grid_border(ws, year_row, 55, 2, TABLE_START_COL + len(all_years) - 1)
 
     ws.cell(row=len(all_years) + 57, column=2, value=(
         "※ 굵게 표시되지 않은 연도(마지막 실적연도 이후)는 사용자/Claude가 제시한 성장률 가정에 따른 추정치입니다. "
