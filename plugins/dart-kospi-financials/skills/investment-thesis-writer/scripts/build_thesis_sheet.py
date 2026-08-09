@@ -193,6 +193,22 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     last_year = int(hist_years[-1][1]) if hist_years else None
     proj_years = [last_year + i for i in range(1, proj_years_n + 1)] if last_year else []
 
+    def find_row_in_col_a(ws, label: str) -> int | None:
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=1):
+            if row[0].value == label:
+                return row[0].row
+        return None
+
+    ia_sheet = wb["투자분석"] if "투자분석" in wb.sheetnames else None
+    ia_row_map = {}
+    if ia_sheet is not None:
+        ia_row_map = {
+            "종가": find_row_in_col_a(ia_sheet, "종가"),
+            "시가총액": find_row_in_col_a(ia_sheet, "시가총액"),
+            "PER(배)": find_row_in_col_a(ia_sheet, "PER(배)"),
+            "PBR(배)": find_row_in_col_a(ia_sheet, "PBR(배)"),
+        }
+
     row_map = {
         "매출액": find_year_row(ind_sheet, "매출액"),
         "영업이익": find_year_row(ind_sheet, "영업이익"),
@@ -205,6 +221,7 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     TABLE_START_COL = 4  # D열부터
     year_row = 39
     idx_row = 38
+    ws.cell(row=idx_row, column=1, value="(억원)").font = NOTE_FONT
     ws.cell(row=idx_row, column=2, value="연차")
     for i, _ in enumerate(hist_years + [(None, y) for y in proj_years]):
         c = TABLE_START_COL + i
@@ -215,12 +232,33 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         ws.cell(row=year_row, column=TABLE_START_COL + i, value=int(y))
 
     labels = [
+        ("시가총액", 40), ("주가", 41), ("PER", 42), ("PBR", 43),
         ("매출액", 44), ("Growth", 45), ("영업이익", 46), ("영업이익률", 47), ("Growth", 48),
         ("순이익", 49), ("순이익률", 50), ("Growth", 51), ("ROE", 52),
         ("자산", 53), ("부채", 54), ("자본", 55),
     ]
     for name, r in labels:
         ws.cell(row=r, column=2, value=name)
+
+    # 시가총액·주가·PER·PBR은 이미 "투자분석" 시트 L섹션에서 계산해 둔 값을
+    # 그대로 참조한다(과거 실적 연도만 — 미래 주가는 예측하지 않는다).
+    if ia_sheet is not None and all(ia_row_map.values()):
+        for i in range(n_hist):
+            col_letter = get_column_letter(TABLE_START_COL + i)
+            ia_col = get_column_letter(3 + i)  # 투자분석 L섹션도 동일한 연도 순서로 C열부터 시작
+            ws[f"{col_letter}40"] = f"='투자분석'!{ia_col}{ia_row_map['시가총액']}"
+            ws[f"{col_letter}41"] = f"='투자분석'!{ia_col}{ia_row_map['종가']}"
+            ws[f"{col_letter}42"] = f"='투자분석'!{ia_col}{ia_row_map['PER(배)']}"
+            ws[f"{col_letter}43"] = f"='투자분석'!{ia_col}{ia_row_map['PBR(배)']}"
+            ws.cell(row=40, column=TABLE_START_COL + i).number_format = "#,##0.0"
+            ws.cell(row=41, column=TABLE_START_COL + i).number_format = "#,##0"
+            ws.cell(row=42, column=TABLE_START_COL + i).number_format = "0.0"
+            ws.cell(row=43, column=TABLE_START_COL + i).number_format = "0.00"
+    else:
+        ws.cell(row=40, column=1, value=(
+            "※ '투자분석' 시트에서 시가총액/종가/PER/PBR을 찾지 못해 비워둡니다"
+            "(KRX_AUTH_KEY 없이 만든 파일일 수 있습니다)."
+        )).font = NOTE_FONT
 
     rev_g = content.get("revenue_growth_assumptions", [0.1] * proj_years_n)
     op_m = content.get("op_margin_assumptions", [0.1] * proj_years_n)
@@ -254,7 +292,6 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
             om = op_m[p] if p < len(op_m) else op_m[-1] if op_m else 0.1
             nm = net_m[p] if p < len(net_m) else net_m[-1] if net_m else 0.1
             ws[f"{col_letter}44"] = f"={prev_col}44*(1+{g})"
-            ws[f"{col_letter}45"] = g
             ws[f"{col_letter}46"] = f"={col_letter}44*{om}"
             ws[f"{col_letter}47"] = om
             ws[f"{col_letter}49"] = f"={col_letter}44*{nm}"
@@ -265,8 +302,16 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
             ws[f"{col_letter}53"] = f"={col_letter}54+{col_letter}55"
             ws[f"{col_letter}52"] = f"=IFERROR({col_letter}49/{col_letter}55,\"\")"
 
+        # Growth(전기 대비 증가율)는 과거·예측 구간 구분 없이 앞 열을 참조하는
+        # 수식으로 통일한다(첫 연도는 전기가 없어 비워둔다).
+        if i > 0:
+            prev_col_g = get_column_letter(TABLE_START_COL + i - 1)
+            ws[f"{col_letter}45"] = f"=IFERROR(({col_letter}44-{prev_col_g}44)/{prev_col_g}44,\"\")"
+            ws[f"{col_letter}48"] = f"=IFERROR(({col_letter}46-{prev_col_g}46)/{prev_col_g}46,\"\")"
+            ws[f"{col_letter}51"] = f"=IFERROR(({col_letter}49-{prev_col_g}49)/{prev_col_g}49,\"\")"
+
         for r in (44, 46, 49, 53, 54, 55):
-            ws.cell(row=r, column=TABLE_START_COL + i).number_format = "#,##0"
+            ws.cell(row=r, column=TABLE_START_COL + i).number_format = "#,##0.0"
         for r in (45, 47, 48, 50, 51, 52):
             ws.cell(row=r, column=TABLE_START_COL + i).number_format = "0.0%"
 
