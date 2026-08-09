@@ -12,7 +12,7 @@ description: >
   "OO 투자분석 해줘", "OO 재무비율/위험신호/청산가치 체크해줘", "OO PER PBR 계산해줘" —
   these add an "투자분석" sheet to the same workbook.
 metadata:
-  version: "0.9.3"
+  version: "0.9.5"
 ---
 
 # DART 재무제표 추출 및 엑셀 생성
@@ -225,6 +225,11 @@ python scripts/build_workbook.py <corp_code> <기업명> --period <annual|quarte
 - **모든 표에 얇은 테두리**: `apply_grid_border()` 헬퍼로 분기/연간 재무제표, 지표 시트, 투자분석의 B~D 섹션(재무지표·위험신호·청산가치) 및 `write_ratio_row`/`write_period_header`를 쓰는 E~L 섹션 전부에 적용했다. 새 표를 추가할 때는 반드시 이 헬퍼(또는 `write_ratio_row`/`write_period_header`)를 통해서 만들어야 테두리가 자동으로 붙는다.
 - **지표_연간 임베드 차트 제목 폰트 12pt**: `_set_chart_title_font_size()` 헬퍼로 적용. `embed_anchor_col`이 있을 때만(=지표_연간) 적용되고 `차트_분기`는 영향 없다.
 - `investment-thesis-writer`의 재무추세표(과거 실적)는 `지표_연간`을 그대로 참조하는 수식이라 별도 수정 없이 억원 단위가 자동으로 반영된다. 예측 구간도 과거 마지막 열에서 복리로 이어지므로 마찬가지로 자동 반영.
+
+### v0.9.5 (지표_분기도 차트 임베드로 통일)
+
+- `차트_분기` 별도 시트를 없애고, `지표_연간`과 동일하게 `지표_분기` 시트 I열부터 차트가 임베드된다(`build_chart_sheet(... embed_anchor_col="I")` 호출로 통일). 자동으로 차트 제목 폰트도 12pt로 맞춰진다(embed_anchor_col이 있으면 항상 적용되는 기존 로직 재사용).
+- 결과적으로 `--period quarterly` 산출물은 `분기_재무제표`, `지표_분기`(표+차트), `원본데이터` 3개 시트(2개 표시)로, `--period both`는 `차트_분기`/`차트_연간` 둘 다 없이 `지표_분기`·`지표_연간` 안에 각각 차트가 들어간 형태로 나온다.
 
 ### v0.9.3 (investment-thesis-writer 재무추세표 보완)
 
