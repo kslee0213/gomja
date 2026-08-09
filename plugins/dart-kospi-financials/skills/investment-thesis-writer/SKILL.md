@@ -11,7 +11,7 @@ description: >
   predictable period, growth/profitability forecast, and final conclusion with
   a target holding period and expected annual return).
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # 투자판단 종합 시트 작성
