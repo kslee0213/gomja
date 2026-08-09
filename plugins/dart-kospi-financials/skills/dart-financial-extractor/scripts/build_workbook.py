@@ -27,7 +27,8 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference, Series
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.drawing.text import CharacterProperties, ParagraphProperties
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -114,11 +115,17 @@ def amount_lookup(data: dict, sj_div: str, account_id: str, field: str = "thstrm
     return None
 
 
+UNIT_DIVISOR = 100_000_000  # 원 -> 억원
+
+
 def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str], reports: dict, sheet_name: str = "원본데이터"):
-    """모든 원자료를 원본 시트에 적재하고, 셀 좌표 인덱스를 반환한다."""
+    """모든 원자료를 원본 시트에 적재하고, 셀 좌표 인덱스를 반환한다.
+    금액은 억원 단위(원 값 / 100,000,000)로 저장한다 — 이 시트가 모든 하위
+    시트·수식의 유일한 소스이므로, 여기서 한 번만 나누면 분기/연간 재무제표,
+    지표 시트, 투자분석 시트의 금액 셀 전부가 자동으로 억원 단위가 된다."""
     ws = wb.create_sheet(sheet_name)
     ws.sheet_state = "hidden"
-    ws["A1"] = "이 시트는 DART 원본 응답값을 그대로 담은 참조용 데이터입니다. 직접 수정하지 마세요."
+    ws["A1"] = "이 시트는 DART 원본 응답값(단위: 억원으로 환산)을 담은 참조용 데이터입니다. 직접 수정하지 마세요."
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
     row = 3
@@ -140,11 +147,11 @@ def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str]
                 ws.cell(row=row, column=1, value=item["account_id"])
                 ws.cell(row=row, column=2, value=item["account_nm"])
                 amt = item.get("thstrm_amount")
-                ws.cell(row=row, column=3, value=float(str(amt).replace(",", "")) if amt not in (None, "") else None).font = BLUE
+                ws.cell(row=row, column=3, value=float(str(amt).replace(",", "")) / UNIT_DIVISOR if amt not in (None, "") else None).font = BLUE
                 cell_index[(sj_div, item["account_id"], label, "thstrm_amount")] = f"'{sheet_name}'!${get_column_letter(3)}${row}"
                 add_amt = item.get("thstrm_add_amount")
                 if add_amt not in (None, ""):
-                    ws.cell(row=row, column=4, value=float(str(add_amt).replace(",", ""))).font = BLUE
+                    ws.cell(row=row, column=4, value=float(str(add_amt).replace(",", "")) / UNIT_DIVISOR).font = BLUE
                     cell_index[(sj_div, item["account_id"], label, "thstrm_add_amount")] = f"'{sheet_name}'!${get_column_letter(4)}${row}"
                 row += 1
             row += 1
@@ -174,11 +181,22 @@ def style_header(ws, row: int, ncols: int):
         c.alignment = Alignment(horizontal="center")
 
 
+THIN_SIDE = Side(style="thin", color="000000")
+THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+
+def apply_grid_border(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
+    """지정한 범위의 모든 셀에 얇은 테두리를 그린다(표 구분선)."""
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            ws.cell(row=r, column=c).border = THIN_BORDER
+
+
 def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: dict, sheet_name: str = "분기_재무제표", hidden: bool = False):
     ws = wb.create_sheet(sheet_name)
     if hidden:
         ws.sheet_state = "hidden"
-    ws["A1"] = "단위: 원 | 음영 셀은 원본데이터 시트 링크 또는 수식으로 자동 계산됩니다."
+    ws["A1"] = "단위: 억원 | 음영 셀은 원본데이터 시트 링크 또는 수식으로 자동 계산됩니다."
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
     header_row = 3
@@ -240,7 +258,7 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
                     if fy_ref and q3_add_ref:
                         cell.value = f"={fy_ref}-{q3_add_ref}"
                         cell.font = BLACK
-                cell.number_format = "#,##0;(#,##0);-"
+                cell.number_format = "#,##0.0;(#,##0.0);-"
             row += 1
         row += 1
 
@@ -249,6 +267,7 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
     for i in range(len(quarter_plan)):
         ws.column_dimensions[get_column_letter(3 + i)].width = 15
     ws.freeze_panes = "C4"
+    apply_grid_border(ws, header_row, row - 1, 1, 2 + len(quarter_plan))
 
     period_labels = [f"{p['year']}Q{p['q']}" for p in quarter_plan]
     return account_row_map, account_name_map, period_labels
@@ -258,7 +277,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
     ws = wb.create_sheet(sheet_name)
     if hidden:
         ws.sheet_state = "hidden"
-    ws["A1"] = "단위: 원 | 사업보고서(연결/별도) 기준, 원본데이터 시트 링크"
+    ws["A1"] = "단위: 억원 | 사업보고서(연결/별도) 기준, 원본데이터 시트 링크"
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
 
     header_row = 3
@@ -290,7 +309,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
                 if ref:
                     cell.value = f"={ref}"
                     cell.font = GREEN
-                cell.number_format = "#,##0;(#,##0);-"
+                cell.number_format = "#,##0.0;(#,##0.0);-"
             row += 1
         row += 1
 
@@ -299,6 +318,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
     for i in range(len(year_list)):
         ws.column_dimensions[get_column_letter(3 + i)].width = 18
     ws.freeze_panes = "C4"
+    apply_grid_border(ws, header_row, row - 1, 1, 2 + len(year_list))
 
     period_labels = [f"{year}" for year in year_list]
     return account_row_map, account_name_map, period_labels
@@ -551,7 +571,7 @@ def build_indicator_sheet(
                     ws.cell(row=row, column=3 + i, value=f'=IF({ref}="",NA(),{ref})')
 
         for i in range(n):
-            ws.cell(row=row, column=3 + i).number_format = "#,##0;(#,##0);-"
+            ws.cell(row=row, column=3 + i).number_format = "#,##0.0;(#,##0.0);-"
         row += 1
 
     row += 1  # 구분 여백
@@ -592,6 +612,7 @@ def build_indicator_sheet(
     for i in range(n):
         ws.column_dimensions[get_column_letter(3 + i)].width = 15
     ws.freeze_panes = "C2"
+    apply_grid_border(ws, 1, row - 1, 2, 2 + n)
 
     return sheet_name, row_of, missing
 
@@ -607,13 +628,21 @@ def _add_line_series(chart: LineChart, ws, row_of: dict, names: list[str], n_per
         chart.series.append(series)
 
 
+def _set_chart_title_font_size(chart, size_pt: int = 12) -> None:
+    """차트 제목 폰트 크기를 지정한다(pt 단위)."""
+    cp = CharacterProperties(sz=size_pt * 100, b=True)
+    chart.title.tx.rich.p[0].pPr = ParagraphProperties(defRPr=cp)
+
+
 def build_chart_sheet(
     wb: Workbook, prefix: str, indicator_sheet_name: str, row_of: dict, n_periods: int,
     embed_anchor_col: str | None = None,
 ):
     """차트를 그린다. embed_anchor_col이 주어지면 별도 시트를 만들지 않고
     지표 시트(indicator_sheet_name) 자체의 그 열부터 차트를 배치한다
-    (표와 겹치지 않도록 호출하는 쪽에서 표 폭보다 오른쪽 열을 넘겨야 한다)."""
+    (표와 겹치지 않도록 호출하는 쪽에서 표 폭보다 오른쪽 열을 넘겨야 한다).
+    embed_anchor_col이 있는 경우(=지표_연간에 임베드하는 경우)는 v0.9.2부터
+    차트 제목 폰트 크기를 12pt로 맞춘다(사용자 요청)."""
     ind_ws = wb[indicator_sheet_name]
     if embed_anchor_col:
         ws = ind_ws
@@ -627,8 +656,10 @@ def build_chart_sheet(
     for title, names in LINE_CHART_GROUPS:
         chart = LineChart()
         chart.title = title
+        if embed_anchor_col:
+            _set_chart_title_font_size(chart, 12)
         chart.style = 2
-        chart.y_axis.title = "금액(원)"
+        chart.y_axis.title = "금액(억원)"
         chart.x_axis.title = "기간"
         chart.height = 9
         chart.width = 22
@@ -642,6 +673,8 @@ def build_chart_sheet(
     bar.type = "col"
     bar.grouping = "clustered"
     bar.title = "그래프6_수익성-안정성 비율(%)"
+    if embed_anchor_col:
+        _set_chart_title_font_size(bar, 12)
     bar.style = 10
     bar.y_axis.title = "%"
     bar.x_axis.title = "기간"
@@ -955,6 +988,7 @@ def build_investment_analysis_sheet(
 
     row = 1
     ws.cell(row=row, column=1, value=f"투자분석 — {company_name}").font = Font(name=FONT_NAME, bold=True, size=14)
+    ws.cell(row=row, column=4, value="(금액 단위: 억원, 비율/배수/일수 제외)").font = NOTE
     row += 2
 
     # --- A. 회사 개황 ---
@@ -990,7 +1024,7 @@ def build_investment_analysis_sheet(
             c = ws.cell(row=row, column=3 + i)
             if ref:
                 c.value = f"={ref}"
-            c.number_format = "#,##0;(#,##0);-"
+            c.number_format = "#,##0.0;(#,##0.0);-"
             c.font = NOTE
         row += 1
     ws.cell(row=base_start_row - 0, column=1)  # no-op anchor
@@ -1012,7 +1046,7 @@ def build_investment_analysis_sheet(
             c = ws.cell(row=row, column=3 + i)
             if ref:
                 c.value = f"={ref}"
-            c.number_format = "#,##0;(#,##0);-"
+            c.number_format = "#,##0.0;(#,##0.0);-"
             c.font = NOTE
         row += 1
     row += 1
@@ -1032,7 +1066,7 @@ def build_investment_analysis_sheet(
             c = ws.cell(row=row, column=3 + i)
             if ref:
                 c.value = f"={ref}"
-            c.number_format = "#,##0;(#,##0);-"
+            c.number_format = "#,##0.0;(#,##0.0);-"
             c.font = NOTE
         row += 1
     # 외환손익 관련은 없는 회사가 많은 게 정상이라 매칭 실패로 취급하지 않는다.
@@ -1046,7 +1080,7 @@ def build_investment_analysis_sheet(
             c = ws.cell(row=row, column=3 + i)
             if ref:
                 c.value = f"={ref}"
-            c.number_format = "#,##0;(#,##0);-"
+            c.number_format = "#,##0.0;(#,##0.0);-"
             c.font = NOTE
         row += 1
     row += 1
@@ -1064,6 +1098,7 @@ def build_investment_analysis_sheet(
     for i, label in enumerate(y_period_labels):
         ws.cell(row=row, column=3 + i, value=label)
     style_header(ws, row, 2 + n)
+    apply_grid_border(ws, row, row, 1, 2 + n)
     row += 1
 
     b_row: dict[str, int] = {}
@@ -1078,6 +1113,7 @@ def build_investment_analysis_sheet(
             if f:
                 c.value = f
             c.number_format = fmt
+        apply_grid_border(ws, row, row, 1, 2 + n)
         row += 1
 
     def b_ref(name: str, i: int) -> str:
@@ -1092,6 +1128,7 @@ def build_investment_analysis_sheet(
         for i, label in enumerate(y_period_labels):
             ws.cell(row=row, column=3 + i, value=label)
         style_header(ws, row, 2 + n)
+        apply_grid_border(ws, row, row, 1, 2 + n)
         row += 1
 
     chart_anchor_row = [1]  # 차트를 세로로 쌓아 내려갈 위치 (리스트로 감싸 클로저에서 갱신)
@@ -1309,6 +1346,7 @@ def build_investment_analysis_sheet(
     for i, label in enumerate(y_period_labels):
         ws.cell(row=row, column=3 + i, value=label)
     style_header(ws, row, 2 + n)
+    apply_grid_border(ws, row, row, 1, 2 + n)
     row += 1
 
     def write_risk_row(name: str, formula_fn):
@@ -1319,6 +1357,7 @@ def build_investment_analysis_sheet(
             c = ws.cell(row=row, column=3 + i)
             if f:
                 c.value = f
+        apply_grid_border(ws, row, row, 1, 2 + n)
         row += 1
 
     write_risk_row(
@@ -1377,6 +1416,7 @@ def build_investment_analysis_sheet(
     ws.cell(row=row, column=2, value="적용비율")
     ws.cell(row=row, column=3, value="조정가치")
     style_header(ws, row, 3)
+    d_header = row
     row += 1
     adj_asset_rows = []
     for label, base_key, pct in haircut_items:
@@ -1391,22 +1431,23 @@ def build_investment_analysis_sheet(
             c.value = f"={src}*{pct}"
         elif src:
             c.value = 0
-        c.number_format = "#,##0"
+        c.number_format = "#,##0.0"
         adj_asset_rows.append(row)
         row += 1
     sum_row = row
     ws.cell(row=row, column=1, value="조정자산 합계").font = LABEL
-    ws.cell(row=row, column=3, value=f"=SUM(C{adj_asset_rows[0]}:C{adj_asset_rows[-1]})").number_format = "#,##0"
+    ws.cell(row=row, column=3, value=f"=SUM(C{adj_asset_rows[0]}:C{adj_asset_rows[-1]})").number_format = "#,##0.0"
     row += 1
     debt_ref = ind_ref("부채총계", last_i)
     ws.cell(row=row, column=1, value="총부채(부채총계)").font = LABEL
     if debt_ref:
-        ws.cell(row=row, column=3, value=f"={debt_ref}").number_format = "#,##0"
+        ws.cell(row=row, column=3, value=f"={debt_ref}").number_format = "#,##0.0"
     row += 1
     liq_row = row
     ws.cell(row=row, column=1, value="청산가치 (조정자산 − 총부채)").font = LABEL
     if debt_ref:
-        ws.cell(row=row, column=3, value=f"=C{sum_row}-C{row - 1}").number_format = "#,##0"
+        ws.cell(row=row, column=3, value=f"=C{sum_row}-C{row - 1}").number_format = "#,##0.0"
+    apply_grid_border(ws, d_header, liq_row, 1, 3)
     row += 2
 
     # --- E. CCC (현금전환주기) ---
@@ -1448,7 +1489,7 @@ def build_investment_analysis_sheet(
     write_ratio_row(
         "FCF = 영업활동현금흐름 - CAPEX",
         lambda i: f"=IFERROR({base_cell('영업활동현금흐름', i)}-ABS({base_cell('유형자산의취득', i)}),NA())",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "FCF마진(%, FCF/매출액)",
@@ -1462,7 +1503,7 @@ def build_investment_analysis_sheet(
         "잉여현금흐름 (FCF)",
         ["FCF = 영업활동현금흐름 - CAPEX"],
         ["FCF마진(%, FCF/매출액)"],
-        primary_ytitle="원", secondary_ytitle="%",
+        primary_ytitle="억원", secondary_ytitle="%",
     )
 
     ws.cell(row=row, column=1, value="G. 현금흐름 3단 구분").font = LABEL
@@ -1471,24 +1512,24 @@ def build_investment_analysis_sheet(
     write_ratio_row(
         "영업활동현금흐름",
         lambda i: f"={base_cell('영업활동현금흐름', i)}",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "투자활동현금흐름",
         lambda i: f"={base_cell('투자활동현금흐름', i)}" if extra_hit.get("투자활동현금흐름") else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "재무활동현금흐름",
         lambda i: f"={base_cell('재무활동현금흐름', i)}" if extra_hit.get("재무활동현금흐름") else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "현금 순증감 (3단 합계, 검증용)",
         lambda i: (
             f"=IFERROR({b_ref('영업활동현금흐름', i)}+{b_ref('투자활동현금흐름', i)}+{b_ref('재무활동현금흐름', i)},NA())"
         ),
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     ws.cell(row=row, column=1, value="※ 검증용 합계는 위 지표 시트의 '현금및현금성자산의증가'와 대체로 비슷해야 합니다(환율 변동 등으로 소폭 차이 가능).").font = NOTE
     row += 2
@@ -1497,7 +1538,7 @@ def build_investment_analysis_sheet(
     add_section_chart(
         "현금흐름 3단 구분",
         ["영업활동현금흐름", "투자활동현금흐름", "재무활동현금흐름", "현금 순증감 (3단 합계, 검증용)"],
-        primary_ytitle="원",
+        primary_ytitle="억원",
     )
 
     ws.cell(row=row, column=1, value="H. DuPont 분해 (ROE = 순이익률 × 총자산회전율 × 레버리지)").font = LABEL
@@ -1537,13 +1578,13 @@ def build_investment_analysis_sheet(
         "NOPLAT = 영업이익×(1-실효세율)",
         lambda i: f"=IFERROR({ind_ref('영업이익', i)}*(1-{b_ref('실효세율(%)', i)}/100),NA())"
         if ind_ref("영업이익", i) else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "투하자본(간이) = 자기자본+비유동부채",
         lambda i: f"=IFERROR({ind_ref('자본총계', i)}+({ind_ref('부채총계', i)}-{ind_ref('유동부채', i)}),NA())"
         if ind_ref("자본총계", i) and ind_ref("부채총계", i) and ind_ref("유동부채", i) else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "ROIC(간이, %)",
@@ -1559,7 +1600,7 @@ def build_investment_analysis_sheet(
         "ROIC / NOPLAT (간이)",
         ["NOPLAT = 영업이익×(1-실효세율)", "투하자본(간이) = 자기자본+비유동부채"],
         ["실효세율(%)", "ROIC(간이, %)"],
-        primary_ytitle="원", secondary_ytitle="%",
+        primary_ytitle="억원", secondary_ytitle="%",
     )
 
     ws.cell(row=row, column=1, value="J. 자산·부채 구성비 변화 (간이)").font = LABEL
@@ -1602,17 +1643,17 @@ def build_investment_analysis_sheet(
     write_ratio_row(
         "외화환산손익",
         lambda i: f"={base_cell('외화환산손익', i)}" if extra_hit.get("외화환산손익") else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "파생상품손익",
         lambda i: f"={base_cell('파생상품손익', i)}" if extra_hit.get("파생상품손익") else "",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     write_ratio_row(
         "외환손익 합계",
         lambda i: f"=IFERROR({b_ref('외화환산손익', i)}+{b_ref('파생상품손익', i)},NA())",
-        fmt="#,##0;(#,##0);-",
+        fmt="#,##0.0;(#,##0.0);-",
     )
     if not has_fx:
         ws.cell(row=row, column=1, value="※ 이 회사 공시에서 외화환산손익·파생상품손익 계정을 찾지 못했습니다. 외환 노출이 적거나 다른 계정명을 쓰는 회사일 수 있습니다(매칭 실패 경고에는 포함하지 않았습니다).").font = NOTE
@@ -1622,7 +1663,7 @@ def build_investment_analysis_sheet(
     add_section_chart(
         "외환손익",
         ["외화환산손익", "파생상품손익", "외환손익 합계"],
-        primary_ytitle="원",
+        primary_ytitle="억원",
     )
 
     ws.cell(row=row, column=1, value="L. 주가 연동 지표 (KRX 종가 기준)").font = LABEL
@@ -1643,6 +1684,10 @@ def build_investment_analysis_sheet(
                 close = _fmt_num(price.get("close_price"))
                 listed = _fmt_num(price.get("listed_shares"))
                 mktcap = _fmt_num(price.get("market_cap")) or (close * listed if close and listed else None)
+                # 당기순이익·자본총계 등 분모가 이미 억원 단위이므로, PER/PBR/PSR 비율이
+                # 맞으려면 시가총액도 반드시 억원으로 맞춰야 한다.
+                if mktcap is not None:
+                    mktcap = mktcap / UNIT_DIVISOR
             else:
                 mktcap = None
             mktcap_by_i.append(mktcap)
@@ -1660,7 +1705,7 @@ def build_investment_analysis_sheet(
         write_ratio_row(
             "시가총액",
             lambda i: mktcap_by_i[i],
-            fmt="#,##0",
+            fmt="#,##0.0",
         )
         write_ratio_row(
             "PER(배)",
