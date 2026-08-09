@@ -641,7 +641,7 @@ def build_chart_sheet(
     """차트를 그린다. embed_anchor_col이 주어지면 별도 시트를 만들지 않고
     지표 시트(indicator_sheet_name) 자체의 그 열부터 차트를 배치한다
     (표와 겹치지 않도록 호출하는 쪽에서 표 폭보다 오른쪽 열을 넘겨야 한다).
-    embed_anchor_col이 있는 경우(=지표_연간에 임베드하는 경우)는 v0.9.2부터
+    embed_anchor_col이 있는 경우(=지표_분기/지표_연간에 임베드하는 경우)는 v0.9.5부터
     차트 제목 폰트 크기를 12pt로 맞춘다(사용자 요청)."""
     ind_ws = wb[indicator_sheet_name]
     if embed_anchor_col:
@@ -1933,7 +1933,8 @@ def main() -> None:
         q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
             wb, "분기", "분기_재무제표", q_labels, q_row_map, q_name_map
         )
-        build_chart_sheet(wb, "분기", q_ind_sheet, q_row_of, len(q_labels))
+        # 차트_분기 별도 시트를 만들지 않고, 지표_분기 시트 I열부터 차트를 임베드한다.
+        build_chart_sheet(wb, "분기", q_ind_sheet, q_row_of, len(q_labels), embed_anchor_col="I")
         if q_missing:
             all_missing["분기"] = q_missing
     if year_list:
@@ -1956,7 +1957,7 @@ def main() -> None:
     # 시트 순서 고정
     desired_order = [
         "분기_재무제표", "연간_재무제표",
-        "지표_분기", "차트_분기",
+        "지표_분기",
         "지표_연간",
         "투자분석",
         "원본데이터",
