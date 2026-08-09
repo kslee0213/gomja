@@ -12,7 +12,7 @@ description: >
   "OO 투자분석 해줘", "OO 재무비율/위험신호/청산가치 체크해줘", "OO PER PBR 계산해줘" —
   these add an "투자분석" sheet to the same workbook.
 metadata:
-  version: "0.9.6"
+  version: "0.9.7"
 ---
 
 # DART 재무제표 추출 및 엑셀 생성
@@ -225,6 +225,10 @@ python scripts/build_workbook.py <corp_code> <기업명> --period <annual|quarte
 - **모든 표에 얇은 테두리**: `apply_grid_border()` 헬퍼로 분기/연간 재무제표, 지표 시트, 투자분석의 B~D 섹션(재무지표·위험신호·청산가치) 및 `write_ratio_row`/`write_period_header`를 쓰는 E~L 섹션 전부에 적용했다. 새 표를 추가할 때는 반드시 이 헬퍼(또는 `write_ratio_row`/`write_period_header`)를 통해서 만들어야 테두리가 자동으로 붙는다.
 - **지표_연간 임베드 차트 제목 폰트 12pt**: `_set_chart_title_font_size()` 헬퍼로 적용. `embed_anchor_col`이 있을 때만(=지표_연간) 적용되고 `차트_분기`는 영향 없다.
 - `investment-thesis-writer`의 재무추세표(과거 실적)는 `지표_연간`을 그대로 참조하는 수식이라 별도 수정 없이 억원 단위가 자동으로 반영된다. 예측 구간도 과거 마지막 열에서 복리로 이어지므로 마찬가지로 자동 반영.
+
+### v0.9.7 (감가상각비 추가 — investment-thesis-writer 오너 어닝 계산용)
+
+- "투자분석" 시트 기초 참고값에 "감가상각비"(CF 항목)가 추가됐다. `investment-thesis-writer`의 "버핏멍거_가치평가" 시트에서 오너 어닝(=당기순이익+감가상각비−CAPEX) 계산에 이 셀을 참조한다. 이 항목을 찾지 못하는 회사는 오너 어닝 행이 비고, 나머지 시트는 정상 작동한다(우아한 성능저하).
 
 ### v0.9.6 (차트 위치 겹침 수정, 현금흐름 4분기 결측 보완)
 
