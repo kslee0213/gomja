@@ -253,10 +253,20 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
                         cell.font = BLACK
                 elif q == 4:
                     fy_ref = cell_index.get((sj_div, acc["account_id"], f"{label}fy", "thstrm_amount"))
-                    # 4분기는 반드시 3분기보고서의 '누적' 필드를 사용한다 (thstrm_add_amount)
+                    # 4분기는 원칙적으로 3분기보고서의 '누적' 필드(thstrm_add_amount)를 쓴다.
                     q3_add_ref = cell_index.get((sj_div, acc["account_id"], f"{label}q3", "thstrm_add_amount"))
                     if fy_ref and q3_add_ref:
                         cell.value = f"={fy_ref}-{q3_add_ref}"
+                        cell.font = BLACK
+                    elif fy_ref:
+                        # 현금흐름표 항목처럼 3분기보고서에 누적 필드가 없는 경우가 있다
+                        # (분기보고서 자체가 이미 연초 누적치로 공시되는 계정 등).
+                        # 이 경우 같은 행에 이미 계산해 둔 1~3분기 값을 빼는 방식으로 대체한다:
+                        # 4분기 = 연간 - 1분기 - 2분기 - 3분기.
+                        q1_col = get_column_letter(col - 3)
+                        q2_col = get_column_letter(col - 2)
+                        q3_col = get_column_letter(col - 1)
+                        cell.value = f"={fy_ref}-{q1_col}{row}-{q2_col}{row}-{q3_col}{row}"
                         cell.font = BLACK
                 cell.number_format = "#,##0.0;(#,##0.0);-"
             row += 1
@@ -1934,7 +1944,12 @@ def main() -> None:
             wb, "분기", "분기_재무제표", q_labels, q_row_map, q_name_map
         )
         # 차트_분기 별도 시트를 만들지 않고, 지표_분기 시트 I열부터 차트를 임베드한다.
-        build_chart_sheet(wb, "분기", q_ind_sheet, q_row_of, len(q_labels), embed_anchor_col="I")
+        # 표 마지막 데이터 열(2+기간수) 뒤로 2칸 띄운 열부터 차트를 놓는다
+        # (분기는 12개면 N열까지 쓰므로 P열부터, 연간은 5개면 G열까지 쓰므로 I열부터).
+        build_chart_sheet(
+            wb, "분기", q_ind_sheet, q_row_of, len(q_labels),
+            embed_anchor_col=get_column_letter(2 + len(q_labels) + 2),
+        )
         if q_missing:
             all_missing["분기"] = q_missing
     if year_list:
@@ -1943,7 +1958,10 @@ def main() -> None:
             wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
         )
         # 차트_연간 별도 시트를 만들지 않고, 지표_연간 시트 I열부터 차트를 임베드한다.
-        build_chart_sheet(wb, "연간", y_ind_sheet, y_row_of, len(y_labels), embed_anchor_col="I")
+        build_chart_sheet(
+            wb, "연간", y_ind_sheet, y_row_of, len(y_labels),
+            embed_anchor_col=get_column_letter(2 + len(y_labels) + 2),
+        )
         if y_missing:
             all_missing["연간"] = y_missing
 
