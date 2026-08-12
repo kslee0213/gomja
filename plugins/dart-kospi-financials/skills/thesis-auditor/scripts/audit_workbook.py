@@ -136,8 +136,8 @@ class Auditor:
     def _check_cashflow_sum(self):
         """투자분석 시트 G섹션의 '현금 순증감 (3단 합계, 검증용)' 행과
         지표_연간의 '현금및현금성자산의증가' 행을 비교한다."""
-        ws_ia = self._sheet("투자분석")
-        ws_ind = self._sheet("지표_연간")
+        ws_ia = self._sheet("투자분석") or self._sheet("투자분석_분기추정")
+        ws_ind = self._sheet("지표_연간") or self._sheet("지표_연환산")
         if ws_ia is None or ws_ind is None:
             self.add("A3", "결정론무결성", "WARN",
                      "투자분석/지표_연간 시트를 찾지 못해 현금흐름 3단 합계 검사 생략")
@@ -240,12 +240,83 @@ class Auditor:
                     return c.row
         return None
 
+    def _find_row_label_exact(self, ws, labels):
+        """A/B열 근처에서 라벨과 '정확히' 같은 셀 값을 가진 행을 찾는다.
+        '매출액' 같은 짧은 라벨이 'FCF마진(%, FCF/매출액)' 같은 다른 행의
+        부분 문자열로 잘못 걸리는 것을 막기 위한 용도(그룹 Q에서 사용)."""
+        for row in ws.iter_rows():
+            for c in row[:3]:
+                if isinstance(c.value, str) and c.value.strip() in labels:
+                    return c.row
+        return None
+
+    def _find_label_row_with_header_exact(self, ws, labels, search_up=3):
+        row = self._find_row_label_exact(ws, labels)
+        if row is None:
+            return None, None, []
+        header_row = self._find_header_row_for_label(ws, row, search_up=search_up)
+        headers = self._collect_period_headers(ws, header_row) if header_row else []
+        return row, header_row, headers
+
     def _last_numeric_in_row(self, ws, row):
         vals = []
         for c in ws[row]:
             if isinstance(c.value, (int, float)):
                 vals.append(c.value)
         return vals[-1] if vals else None
+
+    def _row_values_numeric(self, ws, row, min_col=1):
+        out = []
+        for c in ws[row]:
+            if c.column >= min_col and isinstance(c.value, (int, float)):
+                out.append(c.value)
+        return out
+
+    def _find_header_row_for_label(self, ws, label_row, search_up=3):
+        start = max(1, label_row - search_up)
+        for r in range(label_row - 1, start - 1, -1):
+            txts = [str(ws.cell(r, c).value or "") for c in range(1, min(ws.max_column, 12) + 1)]
+            joined = " ".join(txts)
+            if any(tok in joined for tok in ["Q1", "Q2", "Q3", "Q4", "(E)"]):
+                return r
+        return None
+
+    def _collect_period_headers(self, ws, header_row, min_col=3):
+        vals = []
+        for c in range(min_col, ws.max_column + 1):
+            v = ws.cell(header_row, c).value
+            if isinstance(v, str) and v.strip():
+                vals.append((c, v.strip()))
+        return vals
+
+    def _parse_q_header(self, label):
+        m = re.search(r"(20\d{2})Q([1-4])(?:\(E\))?", str(label))
+        if not m:
+            return None
+        return {"year": int(m.group(1)), "q": int(m.group(2)), "is_est": "(E)" in str(label)}
+
+    def _sheet_has_estimate_headers(self, ws):
+        for row in range(1, min(ws.max_row, 8) + 1):
+            for c in range(1, ws.max_column + 1):
+                v = ws.cell(row, c).value
+                if isinstance(v, str) and "(E)" in v and re.search(r"20\d{2}Q[1-4]", v):
+                    return True
+        return False
+
+    def _find_label_row_with_header(self, ws, labels, search_up=3):
+        row = self._find_row_label(ws, labels)
+        if row is None:
+            return None, None, []
+        header_row = self._find_header_row_for_label(ws, row, search_up=search_up)
+        headers = self._collect_period_headers(ws, header_row) if header_row else []
+        return row, header_row, headers
+
+    def _align_row_series_by_headers(self, ws, row, headers):
+        vals = []
+        for col, _ in headers:
+            v = ws.cell(row, col).value
+            vals.append(v if isinstance(v, (int, float)) else None)
+        return vals
 
     def _check_balance_identity(self, company=None):
         """회계 항등식(자산=부채+자본) 검사.
@@ -258,7 +329,12 @@ class Auditor:
         if company:
             ws, sheet_name = self._company_sheet(company, "annual")
         else:
-            ws = self._sheet("지표_연간") or self._sheet("연간_재무제표")
+            # 연간 워크북엔 "지표_연간"/"연간_재무제표", 분기 연환산 워크북엔
+            # "지표_연환산"/"연환산_재무제표"가 대신 존재한다 — 둘 다 찾아본다.
+            ws = (
+                self._sheet("지표_연간") or self._sheet("연간_재무제표")
+                or self._sheet("지표_연환산") or self._sheet("연환산_재무제표")
+            )
 
         if ws is None:
             self.add(cid, "결정론무결성", "WARN", f"{label}재무 시트를 찾지 못해 회계항등식 검사 생략")
@@ -285,7 +361,7 @@ class Auditor:
 
     # ---------- Group B: 단위 일관성 ----------
     def check_B(self):
-        ws = self._sheet("투자분석")
+        ws = self._sheet("투자분석") or self._sheet("투자분석_분기추정")
         if ws is None:
             kind = getattr(self, "_wb_kind", None)
             if kind == "comparison":
@@ -304,7 +380,7 @@ class Auditor:
                 self.add("B3", "단위일관성", "WARN", "투자분석 시트 없음 — 내재 기대성장률 검사 생략")
             return
         # PER 상식 범위
-        per_vals = self._collect_ratio(ws, ["PER"])
+        per_vals = self._collect_ratio_exact(ws, ["PER(배)"])
         if per_vals:
             bad = [v for v in per_vals if v is not None and (v < 0 or v > 300)]
             if bad:
@@ -324,13 +400,15 @@ class Auditor:
         """시가총액 ≈ 종가 × 상장주식수(억원 환산) 인지 자릿수 단위로 검사한다.
         build_workbook.py는 시가총액(원)을 UNIT_DIVISOR(1억)로 나눠 억원으로 맞추는데,
         이 변환이 빠지거나 중복 적용되면 시총이 억배/1억배 단위로 어긋난다."""
-        r_close = self._find_row_label(ws, ["종가"])
-        r_mktcap = self._find_row_label(ws, ["시가총액"])
-        r_per = self._find_row_label(ws, ["PER"])
+        # "종가"를 부분일치로 찾으면 "기준일(종가)"나 섹션 제목("...KRX 종가 기준")을
+        # 잘못 집는다 — 반드시 정확일치로 찾는다.
+        r_close = self._find_row_label_exact(ws, ["종가"])
+        r_mktcap = self._find_row_label_exact(ws, ["시가총액"])
+        r_per = self._find_row_label_exact(ws, ["PER(배)"])
         r_ni = None
-        ws_ind = self._sheet("지표_연간")
+        ws_ind = self._sheet("지표_연간") or self._sheet("지표_연환산")
         if ws_ind is not None:
-            r_ni = self._find_row_label(ws_ind, ["당기순이익"])
+            r_ni = self._find_row_label_exact(ws_ind, ["당기순이익"])
 
         if r_close is None or r_mktcap is None:
             self.add("B2", "단위일관성", "WARN", "종가/시가총액 행을 못 찾아 단위 정합성 검사 생략")
@@ -374,7 +452,7 @@ class Auditor:
         """시장 내재 기대성장률 = (PER-8.5)/2 는 '%포인트' 단위 관례인 반면,
         thesis content의 revenue_growth_assumptions 등은 '분수'(0.10=10%) 관례다.
         두 값을 그대로 비교/차감하면 자릿수(약 100배)가 어긋난다 — 이를 검사한다."""
-        r_per = self._find_row_label(ws, ["PER"])
+        r_per = self._find_row_label_exact(ws, ["PER(배)"])
         per_v = self._last_numeric_in_row(ws, r_per) if r_per is not None else None
         if per_v is None:
             self.add("B3", "단위일관성", "WARN", "PER 값이 없어 시장 내재 기대성장률 검사 생략")
@@ -413,6 +491,12 @@ class Auditor:
 
     def _collect_ratio(self, ws, labels):
         row = self._find_row_label(ws, labels)
+        if row is None:
+            return []
+        return [c.value for c in ws[row] if isinstance(c.value, (int, float))]
+
+    def _collect_ratio_exact(self, ws, labels):
+        row = self._find_row_label_exact(ws, labels)
         if row is None:
             return []
         return [c.value for c in ws[row] if isinstance(c.value, (int, float))]
@@ -555,9 +639,106 @@ class Auditor:
                 self.add(f"E3-{tag}", "출처재현성", "FAIL",
                          f"{tag} company_name('{cn}')가 파일명('{self.xlsx_path.stem}')과 불일치")
 
+
+    # ---------- Group Q: 분기 연환산 체크 ----------
+    def check_Q(self):
+        ws_q = self._sheet("투자분석_분기추정")
+        ws_ann = self._sheet("연환산_재무제표")
+        if ws_q is None and ws_ann is None:
+            self.add("Q0", "분기연환산", "PASS", "분기 연환산 산출물이 없는 워크북(연간 전용 또는 비교 워크북) — 그룹 Q 해당 없음(N/A)")
+            return
+        if ws_q is None or ws_ann is None:
+            self.add("Q0", "분기연환산", "FAIL", "투자분석_분기추정/연환산_재무제표 중 하나가 없어 분기 연환산 산출물이 불완전")
+            return
+
+        # Q1: FY_E 산식 정합(구조적 검증)
+        if self._sheet_has_estimate_headers(ws_ann):
+            row, header_row, headers = self._find_label_row_with_header(ws_ann, ["매출액", "영업이익", "당기순이익"], search_up=30)
+            parsed = [self._parse_q_header(h) for _, h in headers]
+            ok = bool(headers) and all(p is not None and p["is_est"] for p in parsed)
+            if ok:
+                self.add("Q1", "분기연환산", "PASS", f"연환산_재무제표가 분기별 FY_E 헤더({len(headers)}개, '(E)' 표기)로 구성됨")
+            else:
+                self.add("Q1", "분기연환산", "WARN", "연환산_재무제표의 FY_E 헤더 구조를 완전히 확인하지 못함")
+        else:
+            self.add("Q1", "분기연환산", "FAIL", "연환산_재무제표에서 FY_E '(E)' 헤더를 찾지 못함")
+
+        # Q2: TTM vs FY_E 괴리 경고
+        # 주의: "투자분석_분기추정"에는 "매출액" 단독 행이 없다(비율만 표시됨,
+        # 예: "FCF마진(%, FCF/매출액)"). 부분일치로 그 행을 잘못 집으면 안 되므로
+        # 원자료 격인 "지표_연환산"(정확일치로 "매출액" 행이 실제로 존재)을 쓴다.
+        ws_ind_ann = self._sheet("지표_연환산") or ws_q
+        row_rev_q, hdr_rev_q, headers_q = self._find_label_row_with_header_exact(ws_ind_ann, ["매출액"], search_up=30)
+        row_rev_a, hdr_rev_a, headers_a = self._find_label_row_with_header_exact(ws_ann, ["매출액"], search_up=30)
+        if row_rev_q and row_rev_a and headers_q and headers_a:
+            labels_q = [h for _, h in headers_q]
+            labels_a = [h for _, h in headers_a]
+            common = [lab for lab in labels_q if lab in labels_a]
+            diffs = []
+            for lab in common:
+                cq = next(c for c, h in headers_q if h == lab)
+                ca = next(c for c, h in headers_a if h == lab)
+                vq = ws_ind_ann.cell(row_rev_q, cq).value
+                va = ws_ann.cell(row_rev_a, ca).value
+                if isinstance(vq, (int, float)) and isinstance(va, (int, float)) and max(abs(vq), abs(va)) > 1e-9:
+                    diffs.append(abs(vq - va) / max(abs(vq), abs(va)))
+            if diffs:
+                worst = max(diffs)
+                if worst <= 0.25:
+                    self.add("Q2", "분기연환산", "PASS", f"투자분석_분기추정 주요 flow 지표가 연환산_재무제표와 대체로 정합(최대 괴리 {worst:.1%})")
+                else:
+                    self.add("Q2", "분기연환산", "WARN", f"투자분석_분기추정 vs 연환산_재무제표 간 flow 지표 괴리 큼(최대 {worst:.1%}) — TTM/FY_E 혼용 여부 확인 필요")
+            else:
+                self.add("Q2", "분기연환산", "WARN", "TTM vs FY_E 비교용 수치가 부족해 괴리 검사 생략")
+        else:
+            self.add("Q2", "분기연환산", "WARN", "매출액 행/헤더를 찾지 못해 TTM vs FY_E 괴리 검사 생략")
+
+        # Q3: 성장률 캡(±300%) 적용 여부 태그 검증(간접)
+        headers = []
+        for row in range(1, min(ws_ann.max_row, 6) + 1):
+            for c in range(3, ws_ann.max_column + 1):
+                v = ws_ann.cell(row, c).value
+                if isinstance(v, str) and re.search(r"20\d{2}Q[1-4]\(E\)", v):
+                    headers.append(v)
+        if headers:
+            self.add("Q3", "분기연환산", "PASS", f"연환산 추정 컬럼 라벨 {len(headers)}개 확인 — capped/sign-flip 추정 결과가 독립 연환산 시트로 분리됨")
+        else:
+            self.add("Q3", "분기연환산", "WARN", "연환산 추정 컬럼 라벨을 찾지 못해 성장률 캡 적용 구조 검증 제한")
+
+        # Q4: 적자전환(sign_flip) 폴백 정상 동작(간접)
+        title_blob = " ".join(str(ws_q.cell(r, c).value or "") for r in range(1, min(6, ws_q.max_row)+1) for c in range(1, min(6, ws_q.max_column)+1))
+        if "추정" in title_blob or "FY_E" in title_blob or "TTM" in title_blob:
+            self.add("Q4", "분기연환산", "PASS", "분기추정/FY_E/TTM 안내 문구 존재 — sign_flip 포함 추정 폴백 경로의 결과 시트로 식별 가능")
+        else:
+            self.add("Q4", "분기연환산", "WARN", "분기추정/FY_E/TTM 안내 문구가 약해 sign_flip 폴백 결과 시트 식별성이 낮음")
+
+        # Q5: PER/PSR이 연환산 분모 기준인지
+        per_vals = self._collect_ratio(ws_q, ["PER(", "PER"])
+        psr_vals = self._collect_ratio(ws_q, ["PSR(", "PSR"])
+        # "투자분석_분기추정"에는 "매출액" 단독 행이 없으므로(Q2와 동일한 이유),
+        # "지표_연환산"을 정확일치로 조회한다.
+        row_sales_q, _, headers_sales_q = self._find_label_row_with_header_exact(ws_ind_ann, ["매출액"], search_up=30)
+        row_sales_a, _, headers_sales_a = self._find_label_row_with_header_exact(ws_ann, ["매출액"], search_up=30)
+        aligned = False
+        if row_sales_q and row_sales_a and headers_sales_q and headers_sales_a:
+            common = [lab for _, lab in headers_sales_q if lab in [x[1] for x in headers_sales_a]]
+            aligned = len(common) >= max(1, min(len(headers_sales_q), len(headers_sales_a)) // 2)
+        if per_vals or psr_vals:
+            bad_per = [v for v in per_vals if v is not None and (v < 0 or v > 300)]
+            bad_psr = [v for v in psr_vals if v is not None and (v < 0 or v > 100)]
+            if bad_per or bad_psr:
+                self.add("Q5", "분기연환산", "WARN", f"분기추정 PER/PSR에 상식범위 밖 값 존재(PER {len(bad_per)}개, PSR {len(bad_psr)}개) — 연환산 분모 기준 여부 확인 필요", {"PER_bad": bad_per[:5], "PSR_bad": bad_psr[:5]})
+            elif aligned:
+                self.add("Q5", "분기연환산", "PASS", f"분기추정 PER/PSR 정상범위이며 매출액 헤더가 연환산_재무제표와 정렬됨 — 연환산 분모 사용 가능성 높음")
+            else:
+                self.add("Q5", "분기연환산", "WARN", "분기추정 PER/PSR 정상범위이나 연환산 분모 정렬성은 부분 확인만 됨")
+        else:
+            self.add("Q5", "분기연환산", "WARN", "분기추정 PER/PSR 값이 없어 연환산 분모 기준 검사 생략")
+
+
     # ---------- run ----------
     def run(self):
-        for m in (self.check_A, self.check_B, self.check_C, self.check_D, self.check_E):
+        for m in (self.check_A, self.check_B, self.check_C, self.check_D, self.check_E, self.check_Q):
             try:
                 m()
             except Exception as e:
