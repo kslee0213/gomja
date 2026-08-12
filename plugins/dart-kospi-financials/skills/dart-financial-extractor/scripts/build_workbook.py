@@ -959,6 +959,273 @@ def _fmt_num(v):
         return None
 
 
+
+
+# ===========================================================================
+# 분기 연환산(annualization) 코어 — v0.11.0
+# ---------------------------------------------------------------------------
+# 분기 flow(매출·이익·현금흐름)를 그대로 PER/PSR 등에 쓰면 ~4배 왜곡되므로,
+# (1) YoY 방식 FY_E(연간 추정) 과 (2) TTM(직전 4분기 합) 을 계산한다.
+# BS(자산/부채/자본 등 잔액)는 stock 이므로 연환산하지 않고 분기말 값을 그대로 쓴다.
+# ===========================================================================
+
+ANNUALIZE_CAP = 3.0  # 성장배수 캡: capped(x) in [1-CAP, 1+CAP] = [-2.0, 4.0]
+# ⚠️ 의도적으로 설계한 게 아니라 "과도한 왜곡 방지용 안전장치"로 존재하는 값이다.
+# 어떤 계정이 전년 동기 대비 4배(=400%, ratio=4.0) 이상으로 튀면, 그 계정의
+# FY_E 계산에 쓰이는 성장배수를 실제 비율이 아니라 300%(=capped 상한 1+3.0=4.0배,
+# 즉 ratio가 4.0을 넘어도 그대로 4.0으로 눌러 계산)로 강제로 눌러서 사용한다.
+# (하한도 동일하게: ratio가 -2.0보다 작게 튀면 -2.0으로 눌림)
+# 이 캡은 계정마다 "독립적으로" 적용된다 — 즉 당기순이익만 유별나게 튀어도
+# 매출액 등 다른 계정의 캡 적용 여부와는 무관하다. 캡이 실제로 걸린 경우
+# tag가 "yoy_capped"로 표시되어(연환산_재무제표의 태그 정보를 통해) 구분 가능하다.
+# 실사용 회사가 이 캡에 걸릴 정도로 급성장/급감했다면, 이 시트의 FY_E 값은
+# 실제 예상치를 과소/과대평가할 수 있으므로 사용자에게 안내가 필요하다.
+
+
+def _q_ytd_won(p: dict, sj: str, aid: str):
+    """해당 분기 시점의 '당기누적(YTD, 원 단위)' 값.
+    1Q -> q1 thstrm_amount(=1분기 누적)
+    2Q -> h1 thstrm_amount(=반기 누적)
+    3Q -> q3 thstrm_add_amount(=9개월 누적). 없으면 q3 thstrm_amount 폴백(주의: 3M일 수 있음)
+    4Q -> fy thstrm_amount(=연간)
+    """
+    q = p["q"]
+    if q == 1:
+        return amount_lookup(p.get("q1"), sj, aid, "thstrm_amount")
+    if q == 2:
+        return amount_lookup(p.get("h1"), sj, aid, "thstrm_amount")
+    if q == 3:
+        v = amount_lookup(p.get("q3"), sj, aid, "thstrm_add_amount")
+        if v is None:
+            v = amount_lookup(p.get("q3"), sj, aid, "thstrm_amount")
+        return v
+    if q == 4:
+        return amount_lookup(p.get("fy"), sj, aid, "thstrm_amount")
+    return None
+
+
+def _prior_year_ytd_won(reports: dict, year: str, q: int, sj: str, aid: str):
+    """전년 '동기 누적(원)'. q1->11013, q2->11012, q3->11014(add), q4->11011."""
+    py = str(int(year) - 1)
+    yr = (reports or {}).get(py, {})
+    if q == 1:
+        return amount_lookup(yr.get("11013"), sj, aid, "thstrm_amount")
+    if q == 2:
+        return amount_lookup(yr.get("11012"), sj, aid, "thstrm_amount")
+    if q == 3:
+        v = amount_lookup(yr.get("11014"), sj, aid, "thstrm_add_amount")
+        if v is None:
+            v = amount_lookup(yr.get("11014"), sj, aid, "thstrm_amount")
+        return v
+    if q == 4:
+        return amount_lookup(yr.get("11011"), sj, aid, "thstrm_amount")
+    return None
+
+
+def _prior_year_full_won(reports: dict, year: str, sj: str, aid: str):
+    """전년 '연간 실측(원)' = 전년 사업보고서(11011) thstrm_amount."""
+    py = str(int(year) - 1)
+    return amount_lookup((reports or {}).get(py, {}).get("11011"), sj, aid, "thstrm_amount")
+
+
+def _capped(x: float) -> float:
+    lo, hi = 1.0 - ANNUALIZE_CAP, 1.0 + ANNUALIZE_CAP
+    return max(lo, min(hi, x))
+
+
+def fy_estimate_yoy(reports: dict, p: dict, sj: str, aid: str):
+    """방법①: YoY 기반 연간 추정(FY_E, 원 단위) + 태그.
+    반환: (value_or_None, tag)
+      FY_E = YTD + (PrevFull - PrevYTD) * capped(YTD / PrevYTD)
+    태그: actual(4분기=실측) / yoy / yoy_capped / no_ytd / no_prior /
+          prev_ytd_zero / sign_flip(적자<->흑자 전환) / prev_ytd_neg
+    """
+    q = p["q"]
+    year = p["year"]
+    ytd = _q_ytd_won(p, sj, aid)
+
+    # 4분기(=사업보고서 확보)면 연간 실측 그대로.
+    if q == 4:
+        if ytd is None:
+            return None, "no_ytd"
+        return ytd, "actual"
+
+    if ytd is None:
+        return None, "no_ytd"
+
+    prev_ytd = _prior_year_ytd_won(reports, year, q, sj, aid)
+    prev_full = _prior_year_full_won(reports, year, sj, aid)
+    if prev_ytd is None or prev_full is None:
+        # 전년 자료 부족 -> 단순 비례 폴백 (YTD를 연간으로 스케일).
+        # 분기별 대략 비율: 1Q~0.25, 2Q~0.5, 3Q~0.75.
+        frac = {1: 0.25, 2: 0.5, 3: 0.75}.get(q)
+        if frac:
+            return ytd / frac, "no_prior"
+        return None, "no_prior"
+
+    if prev_ytd == 0:
+        # 전년 동기누적이 0 -> 배수 정의 불가. 잔여분(PrevFull-PrevYTD) 그대로 가산.
+        return ytd + (prev_full - prev_ytd), "prev_ytd_zero"
+
+    # 부호 전환(적자<->흑자): 성장배수가 의미 없음 -> 잔여분 그대로 가산.
+    if (ytd < 0) != (prev_ytd < 0):
+        return ytd + (prev_full - prev_ytd), "sign_flip"
+
+    if prev_ytd < 0:
+        # 전년 동기누적이 음수(적자)면 배수 부호가 뒤집혀 위험 -> 잔여분 그대로.
+        return ytd + (prev_full - prev_ytd), "prev_ytd_neg"
+
+    ratio = ytd / prev_ytd
+    capped = _capped(ratio)
+    fy_e = ytd + (prev_full - prev_ytd) * capped
+    tag = "yoy_capped" if abs(capped - ratio) > 1e-9 else "yoy"
+    return fy_e, tag
+
+
+def _q_discrete_won(p: dict, sj: str, aid: str):
+    """해당 분기의 '단일분기(discrete, 3M) flow(원)'.
+    1Q = q1
+    2Q = h1 - q1
+    3Q = q3(당기 thstrm_amount, 이미 3M) — 없으면 (q3_add9M - h1)
+    4Q = fy - q3_add9M
+    누락 시 None."""
+    q = p["q"]
+    if q == 1:
+        return amount_lookup(p.get("q1"), sj, aid, "thstrm_amount")
+    if q == 2:
+        h1 = amount_lookup(p.get("h1"), sj, aid, "thstrm_amount")
+        q1 = amount_lookup(p.get("q1"), sj, aid, "thstrm_amount")
+        return (h1 - q1) if (h1 is not None and q1 is not None) else None
+    if q == 3:
+        cur = amount_lookup(p.get("q3"), sj, aid, "thstrm_amount")
+        if cur is not None:
+            return cur
+        add9 = amount_lookup(p.get("q3"), sj, aid, "thstrm_add_amount")
+        # h1은 이 plan 원소엔 없으므로 3분기 단독은 add9 - (전분기 반기누적) 불가 -> None
+        return None
+    if q == 4:
+        fy = amount_lookup(p.get("fy"), sj, aid, "thstrm_amount")
+        add9 = amount_lookup(p.get("q3"), sj, aid, "thstrm_add_amount")
+        return (fy - add9) if (fy is not None and add9 is not None) else None
+    return None
+
+
+def ttm_estimate(quarter_plan: list[dict], idx: int, sj: str, aid: str):
+    """방법②: TTM(Trailing Twelve Months, 원 단위) = 직전 4개 분기 discrete flow 합.
+    idx는 quarter_plan 내 위치(오래된->최신 정렬). idx<3이면 4개 분기 확보 불가 -> None.
+    한 분기라도 discrete 계산 실패면 None(부분합 왜곡 방지)."""
+    if idx < 3:
+        return None
+    total = 0.0
+    for j in range(idx - 3, idx + 1):
+        v = _q_discrete_won(quarter_plan[j], sj, aid)
+        if v is None:
+            return None
+        total += v
+    return total
+
+
+def compute_annualized_series(reports: dict, quarter_plan: list[dict],
+                              account_row_map: dict, account_name_map: dict):
+    """투자분석(분기추정) 시트가 쓸 시계열을 원 단위로 산출한다.
+    반환: (fy_series, ttm_series, bs_series, tag_by_key)
+      fy_series[key]  : 분기별 FY_E(원)      — flow 지표
+      ttm_series[key] : 분기별 TTM(원)        — flow 지표(참고/검증용)
+      bs_series[key]  : 분기별 분기말 잔액(원) — stock 지표(BS)
+      tag_by_key[key] : 분기별 FY_E 태그 리스트
+    key는 METRIC_RULES 상의 지표명."""
+    flow_keys = ["매출액", "영업이익", "당기순이익", "영업활동현금흐름"]
+    bs_keys = ["자산총계", "부채총계", "자본총계", "유동자산", "유동부채"]
+
+    fy_series: dict[str, list] = {}
+    ttm_series: dict[str, list] = {}
+    bs_series: dict[str, list] = {}
+    tag_by_key: dict[str, list] = {}
+
+    for key in flow_keys:
+        hit = resolve_metric(key, account_row_map, account_name_map) if key in METRIC_RULES else None
+        fy_vals, ttm_vals, tags = [], [], []
+        for idx, p in enumerate(quarter_plan):
+            if hit is None:
+                fy_vals.append(None); ttm_vals.append(None); tags.append("no_metric"); continue
+            sj, aid = hit
+            v, tag = fy_estimate_yoy(reports, p, sj, aid)
+            fy_vals.append(v); tags.append(tag)
+            ttm_vals.append(ttm_estimate(quarter_plan, idx, sj, aid))
+        fy_series[key] = fy_vals
+        ttm_series[key] = ttm_vals
+        tag_by_key[key] = tags
+
+    for key in bs_keys:
+        hit = resolve_metric(key, account_row_map, account_name_map) if key in METRIC_RULES else None
+        vals = []
+        for p in quarter_plan:
+            if hit is None:
+                vals.append(None); continue
+            sj, aid = hit
+            # BS는 각 분기 보고서의 기말 잔액(thstrm_amount).
+            # 우선순위: 해당 분기 보고서 -> 없으면 근접 보고서.
+            data = p.get("fy") or p.get("q3") or p.get("h1") or p.get("q1")
+            vals.append(amount_lookup(data, sj, aid, "thstrm_amount"))
+        bs_series[key] = vals
+
+    return fy_series, ttm_series, bs_series, tag_by_key
+
+
+def build_annualized_estimate_sheet(wb, quarter_plan, reports,
+                                    account_row_map, account_name_map,
+                                    sheet_name="연환산_재무제표", hidden=True):
+    """분기별 연환산 추정 재무제표 시트를 만든다.
+    - 레이아웃은 분기_재무제표와 동일한 계정 행(account_row_map) 사용.
+    - 컬럼: 분기별 1개(라벨=f"{year}Q{q}(E)").
+    - flow 행(IS/CIS/CF): FY_E(억원) 값을 기록(수식 아닌 값).
+    - stock 행(BS): 해당 분기말 잔액(억원) 그대로.
+    반환: (period_labels, tag_map)
+      period_labels: 컬럼 라벨 리스트
+      tag_map: {(sj,aid): [tag,...]}  flow 항목의 분기별 FY_E 태그
+    지표 시트(build_indicator_sheet)가 이 시트를 source 로 참조하므로,
+    행 위치는 반드시 account_row_map 과 일치해야 한다."""
+    ws = wb.create_sheet(sheet_name)
+    if hidden:
+        ws.sheet_state = "hidden"
+
+    labels = [f"{p['year']}Q{p['q']}(E)" for p in quarter_plan]
+
+    # 헤더
+    ws.cell(row=1, column=1, value="연환산 추정 재무제표 (flow=FY_E 추정, BS=분기말 실측)").font = BOLD
+    ws.cell(row=2, column=1, value="계정")
+    ws.cell(row=2, column=2, value="구분")
+    for i, lab in enumerate(labels):
+        ws.cell(row=2, column=3 + i, value=lab)
+    style_header(ws, 2, 2 + len(labels))
+
+    tag_map: dict = {}
+
+    # account_row_map: {(sj_div, account_id): row}. 이름은 account_name_map 사용.
+    for (sj, aid), r in account_row_map.items():
+        nm = account_name_map.get((sj, aid), aid)
+        ws.cell(row=r, column=1, value=nm)
+        ws.cell(row=r, column=2, value=sj)
+        is_bs = (sj == "BS")
+        tags = []
+        for i, p in enumerate(quarter_plan):
+            col = 3 + i
+            if is_bs:
+                data = p.get("fy") or p.get("q3") or p.get("h1") or p.get("q1")
+                won = amount_lookup(data, sj, aid, "thstrm_amount")
+            else:
+                won, tag = fy_estimate_yoy(reports, p, sj, aid)
+                tags.append(tag)
+            if won is not None:
+                c = ws.cell(row=r, column=col, value=won / UNIT_DIVISOR)
+                c.number_format = "#,##0.0"
+        if not is_bs:
+            tag_map[(sj, aid)] = tags
+
+    ws.freeze_panes = "C3"
+    return labels, tag_map
+
+
 def build_investment_analysis_sheet(
     wb: Workbook,
     company_name: str,
@@ -970,9 +1237,14 @@ def build_investment_analysis_sheet(
     y_ind_sheet: str,
     y_row_of: dict,
     reports: dict | None = None,
+    sheet_title: str = "투자분석",
+    source_flow_sheet: str = "연간_재무제표",
+    period_dates: list[str] | None = None,
+    annualized_series: dict | None = None,
+    banner: str | None = None,
 ) -> list[str]:
     """'투자분석' 시트를 만든다. 반환값: 이번에 못 찾은/못 가져온 항목 경고 목록."""
-    ws = wb.create_sheet("투자분석")
+    ws = wb.create_sheet(sheet_title)
     n = len(y_period_labels)
     warnings: list[str] = []
     profile = load_company_profile(corp_code)
@@ -994,7 +1266,7 @@ def build_investment_analysis_sheet(
         sj, aid = hit
         src_row = y_account_row_map[(sj, aid)]
         col = get_column_letter(3 + i)
-        return f"'연간_재무제표'!{col}{src_row}"
+        return f"'{source_flow_sheet}'!{col}{src_row}"
 
     def ind_ref(name: str, i: int) -> str:
         r = y_row_of.get(name)
@@ -1004,9 +1276,13 @@ def build_investment_analysis_sheet(
         return f"'{y_ind_sheet}'!{col}{r}"
 
     row = 1
-    ws.cell(row=row, column=1, value=f"투자분석 — {company_name}").font = Font(name=FONT_NAME, bold=True, size=14)
+    ws.cell(row=row, column=1, value=f"{sheet_title} — {company_name}").font = Font(name=FONT_NAME, bold=True, size=14)
     ws.cell(row=row, column=4, value="(금액 단위: 억원, 비율/배수/일수 제외)").font = NOTE
-    row += 2
+    row += 1
+    if banner:
+        ws.cell(row=row, column=1, value=banner).font = WARN
+        row += 1
+    row += 1
 
     # --- A. 회사 개황 ---
     ws.cell(row=row, column=1, value="A. 회사 개황").font = LABEL
@@ -1697,7 +1973,8 @@ def build_investment_analysis_sheet(
         price_by_i: list[dict | None] = []
         mktcap_by_i: list[float | None] = []
         for i, year in enumerate(year_list):
-            price = load_price(stock_code, f"{year}1231")
+            ref_date = period_dates[i] if period_dates and i < len(period_dates) and period_dates[i] else f"{year}1231"
+            price = load_price(stock_code, ref_date)
             price_by_i.append(price)
             if price:
                 close = _fmt_num(price.get("close_price"))
@@ -1815,6 +2092,8 @@ def build_investment_analysis_sheet(
     # 등급 판정을 위해 원자료(cache)에서 지표값을 직접 계산한다.
     # (시트 셀은 수식이라 openpyxl로는 값을 읽을 수 없어 원자료를 다시 계산한다)
     def series(key: str) -> list[float | None]:
+        if annualized_series and key in annualized_series:
+            return annualized_series[key]
         hit = resolve_metric(key, y_account_row_map, y_account_name_map) if key in METRIC_RULES else None
         out: list[float | None] = []
         for year in year_list:
@@ -1861,7 +2140,8 @@ def build_investment_analysis_sheet(
     price_available = False
     if stock_code:
         for i, year in enumerate(year_list):
-            price = load_price(stock_code, f"{year}1231")
+            ref_date = period_dates[i] if period_dates and i < len(period_dates) and period_dates[i] else f"{year}1231"
+            price = load_price(stock_code, ref_date)
             if not price:
                 per_list.append(None)
                 pbr_list.append(None)
@@ -1952,21 +2232,49 @@ def main() -> None:
         q_ind_sheet, q_row_of, q_missing = build_indicator_sheet(
             wb, "분기", "분기_재무제표", q_labels, q_row_map, q_name_map
         )
-        # 차트_분기 별도 시트를 만들지 않고, 지표_분기 시트 I열부터 차트를 임베드한다.
-        # 표 마지막 데이터 열(2+기간수) 뒤로 2칸 띄운 열부터 차트를 놓는다
-        # (분기는 12개면 N열까지 쓰므로 P열부터, 연간은 5개면 G열까지 쓰므로 I열부터).
         build_chart_sheet(
             wb, "분기", q_ind_sheet, q_row_of, len(q_labels),
             embed_anchor_col=get_column_letter(2 + len(q_labels) + 2),
         )
         if q_missing:
             all_missing["분기"] = q_missing
+
+        q_ann_labels, q_tag_map = build_annualized_estimate_sheet(
+            wb, quarter_plan, reports, q_row_map, q_name_map,
+            sheet_name="연환산_재무제표", hidden=True,
+        )
+        q_ann_ind_sheet, q_ann_row_of, q_ann_missing = build_indicator_sheet(
+            wb, "연환산", "연환산_재무제표", q_ann_labels, q_row_map, q_name_map, sheet_name="지표_연환산"
+        )
+        build_chart_sheet(
+            wb, "연환산", q_ann_ind_sheet, q_ann_row_of, len(q_ann_labels),
+            embed_anchor_col=get_column_letter(2 + len(q_ann_labels) + 2),
+        )
+        if q_ann_missing:
+            all_missing["연환산"] = q_ann_missing
+
+        fy_series, ttm_series, bs_series, _q_tags = compute_annualized_series(reports, quarter_plan, q_row_map, q_name_map)
+        ann_series = {**fy_series, **bs_series}
+        q_year_list = [str(p["year"]) for p in quarter_plan]
+        q_period_dates = [
+            {1: f"{p['year']}0331", 2: f"{p['year']}0630", 3: f"{p['year']}0930", 4: f"{p['year']}1231"}[p['q']]
+            for p in quarter_plan
+        ]
+        ia_q_warnings = build_investment_analysis_sheet(
+            wb, args.company_name, args.corp_code, q_ann_labels, q_year_list,
+            q_row_map, q_name_map, q_ann_ind_sheet, q_ann_row_of, reports,
+            sheet_title="투자분석_분기추정", source_flow_sheet="연환산_재무제표",
+            period_dates=q_period_dates, annualized_series=ann_series,
+            banner="※ 본 시트는 분기 누적 공시를 바탕으로 연간 환산(FY_E)·TTM을 이용해 추정한 투자분석입니다.",
+        )
+        if ia_q_warnings:
+            all_missing["투자분석_분기추정(계정 매칭 실패)"] = ia_q_warnings
+
     if year_list:
         y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
         y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
             wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
         )
-        # 차트_연간 별도 시트를 만들지 않고, 지표_연간 시트 I열부터 차트를 임베드한다.
         build_chart_sheet(
             wb, "연간", y_ind_sheet, y_row_of, len(y_labels),
             embed_anchor_col=get_column_letter(2 + len(y_labels) + 2),
@@ -1983,10 +2291,10 @@ def main() -> None:
 
     # 시트 순서 고정
     desired_order = [
-        "분기_재무제표", "연간_재무제표",
+        "분기_재무제표", "연간_재무제표", "연환산_재무제표",
         "지표_분기",
-        "지표_연간",
-        "투자분석",
+        "지표_연간", "지표_연환산",
+        "투자분석", "투자분석_분기추정",
         "원본데이터",
     ]
     wb._sheets = [wb[name] for name in desired_order if name in wb.sheetnames]
