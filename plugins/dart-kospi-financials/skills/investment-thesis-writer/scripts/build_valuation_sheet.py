@@ -21,6 +21,7 @@ content.json 스키마는 이 파일 하단 CONTENT_SCHEMA_EXAMPLE 참고.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -81,22 +82,28 @@ def style_header(ws, row: int, min_col: int, max_col: int):
         c.alignment = Alignment(horizontal="center")
 
 
-def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None = None) -> str:
+def build_valuation_sheet(
+    src_path: str, content_path: str, outdir: str | None = None,
+    ind_sheet_name: str = "지표_연간",
+    ia_sheet_name: str = "투자분석",
+    target_sheet_name: str = "버핏멍거_가치평가",
+    period_mode: str = "annual",
+) -> str:
     wb = load_workbook(src_path)
-    if "지표_연간" not in wb.sheetnames or "투자분석" not in wb.sheetnames:
-        print("ERROR: 원본 파일에 '지표_연간'/'투자분석' 시트가 필요합니다. "
-              "먼저 dart-financial-extractor로 '--period annual' 파일을 만드세요.", file=sys.stderr)
+    if ind_sheet_name not in wb.sheetnames or ia_sheet_name not in wb.sheetnames:
+        print(f"ERROR: 원본 파일에 '{ind_sheet_name}'/'{ia_sheet_name}' 시트가 필요합니다. "
+              "먼저 dart-financial-extractor로 워크북을 만드세요.", file=sys.stderr)
         sys.exit(1)
-    ind = wb["지표_연간"]
-    ia = wb["투자분석"]
+    ind = wb[ind_sheet_name]
+    ia = wb[ia_sheet_name]
     content = json.loads(Path(content_path).read_text(encoding="utf-8"))
 
-    if "버핏멍거_가치평가" in wb.sheetnames:
-        del wb["버핏멍거_가치평가"]
-    ws = wb.create_sheet("버핏멍거_가치평가")
+    if target_sheet_name in wb.sheetnames:
+        del wb[target_sheet_name]
+    ws = wb.create_sheet(target_sheet_name)
     ws.sheet_view.showGridLines = False
 
-    # --- 연도 헤더(지표_연간과 동일한 기간) ---
+    # --- 연도 헤더(소스 지표 시트와 동일한 기간) ---
     header_row_ind = None
     for r in range(1, 5):
         if ind.cell(row=r, column=1).value == "지표":
@@ -129,6 +136,11 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     ws.cell(row=row, column=1, value="버핏-멍거 가치평가").font = TITLE_FONT
     ws.cell(row=row, column=4, value="(금액 단위: 억원, 참고자료: 워렌버핏과 찰리멍거)").font = NOTE_FONT
     row += 2
+    if period_mode == "quarterly":
+        ws.cell(row=row, column=1, value=(
+            "※ 본 시트는 분기 누적 공시를 연간 환산(FY_E)한 값을 기반으로 한 추정 가치평가입니다."
+        )).font = Font(name=FONT_NAME, italic=True, size=9, color="C00000")
+        row += 2
     if missing:
         ws.cell(row=row, column=1, value=(
             f"※ 아래 항목의 소스 셀을 찾지 못해 일부 계산이 비어 있을 수 있습니다: {', '.join(missing)}"
@@ -170,14 +182,14 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
         if not r:
             return None
         col = get_column_letter(3 + i)
-        return f"'지표_연간'!{col}{r}"
+        return f"'{ind_sheet_name}'!{col}{r}"
 
     def ia_ref(key: str, i: int) -> str | None:
         r = ia_row.get(key)
         if not r:
             return None
         col = get_column_letter(3 + i)
-        return f"'투자분석'!{col}{r}"
+        return f"'{ia_sheet_name}'!{col}{r}"
 
     # === A. 오너 어닝 (당기순이익 + 감가상각비 - CAPEX) ===
     section_title("A. 오너 어닝 (Owner Earnings) = 당기순이익 + 감가상각비 − |CAPEX|")
@@ -217,11 +229,18 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     eps_row = snap_row("EPS (주가/PER)", f"=IFERROR({price_ref}/{per_ref},\"\")" if per_ref else None, "#,##0")
     ni_first = ind_ref("당기순이익", 0)
     ni_last = ind_ref("당기순이익", last_i)
+    # CAGR 지수는 "구간 개수"가 아니라 "실제 경과 연수"여야 한다. 연간 모드는
+    # 라벨이 "2023" 식이라 연간=구간이지만, 분기 모드는 라벨이 "2023Q1(E)" 식이라
+    # 구간(분기) 수를 그대로 쓰면 분기 복리를 연 복리로 착각하는 오류가 생긴다.
+    _y_first = re.match(r"(\d{4})", str(period_labels[0]))
+    _y_last = re.match(r"(\d{4})", str(period_labels[last_i]))
+    years_span = (int(_y_last.group(1)) - int(_y_first.group(1))) if (_y_first and _y_last) else last_i
+    years_span = max(years_span, 1)
     cagr_formula = (
-        f"=IFERROR(SIGN({ni_last})*SIGN({ni_first})*(({ni_last}/{ni_first})^(1/{last_i})-1),\"\")"
-        if ni_first and ni_last and last_i > 0 else None
+        f"=IFERROR(SIGN({ni_last})*SIGN({ni_first})*(({ni_last}/{ni_first})^(1/{years_span})-1),\"\")"
+        if ni_first and ni_last and years_span > 0 else None
     )
-    cagr_row = snap_row(f"실제 순이익 CAGR ({n}개년)", cagr_formula, "0.0%")
+    cagr_row = snap_row(f"실제 순이익 CAGR ({years_span}개년 환산)", cagr_formula, "0.0%")
     asset_iv_row = snap_row("자산기반 내재가치 = BPS×10", f"=IFERROR(B{bps_row}*10,\"\")" if bps_row else None, "#,##0")
     growth_iv_row = snap_row(
         "성장주 내재가치 = EPS×(8.5+2×기대성장률%)",
@@ -392,7 +411,8 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
         outdir_path = Path(outdir)
         outdir_path.mkdir(parents=True, exist_ok=True)
         company = content.get("company_name", "기업")
-        outfile = outdir_path / f"{company}_가치평가_{today}.xlsx"
+        suffix = "가치평가_분기추정" if period_mode == "quarterly" else "가치평가"
+        outfile = outdir_path / f"{company}_{suffix}_{today}.xlsx"
     wb.save(outfile)
     return str(outfile)
 
@@ -405,8 +425,20 @@ def main() -> None:
         "--outdir", default=None,
         help="지정하지 않으면(기본값) src_xlsx에 시트를 추가해 같은 파일로 덮어쓴다.",
     )
+    ap.add_argument(
+        "--period", choices=["annual", "quarterly"], default="annual",
+        help="quarterly면 '지표_연환산'/'투자분석_분기추정'을 참조해 "
+             "'버핏멍거_가치평가_분기추정' 시트를 만든다.",
+    )
     args = ap.parse_args()
-    outfile = build_valuation_sheet(args.src_xlsx, args.content_json, args.outdir)
+    if args.period == "quarterly":
+        outfile = build_valuation_sheet(
+            args.src_xlsx, args.content_json, args.outdir,
+            ind_sheet_name="지표_연환산", ia_sheet_name="투자분석_분기추정",
+            target_sheet_name="버핏멍거_가치평가_분기추정", period_mode="quarterly",
+        )
+    else:
+        outfile = build_valuation_sheet(args.src_xlsx, args.content_json, args.outdir)
     print(json.dumps({"saved": outfile}, ensure_ascii=False))
 
 
