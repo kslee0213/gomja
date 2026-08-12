@@ -18,6 +18,7 @@ content.json 스키마는 이 파일 하단 CONTENT_SCHEMA_EXAMPLE 참고.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -83,22 +84,34 @@ def find_year_row(ws, label: str) -> int | None:
     return None
 
 
-def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = None) -> str:
+def build_thesis_sheet(
+    src_path: str, content_path: str, outdir: str | None = None,
+    ind_sheet_name: str = "지표_연간",
+    ia_sheet_name: str = "투자분석",
+    target_sheet_name: str = "투자판단 종합",
+    period_mode: str = "annual",
+) -> str:
     wb = load_workbook(src_path)
-    if "투자분석" not in wb.sheetnames:
-        print("ERROR: 원본 파일에 '투자분석' 시트가 없습니다. 먼저 build_workbook.py로 만드세요.", file=sys.stderr)
+    if ia_sheet_name not in wb.sheetnames:
+        print(f"ERROR: 원본 파일에 '{ia_sheet_name}' 시트가 없습니다. 먼저 build_workbook.py로 만드세요.", file=sys.stderr)
         sys.exit(1)
-    ind_sheet = wb["지표_연간"] if "지표_연간" in wb.sheetnames else None
+    ind_sheet = wb[ind_sheet_name] if ind_sheet_name in wb.sheetnames else None
     if ind_sheet is None:
-        print("ERROR: 원본 파일에 '지표_연간' 시트가 없습니다(연간 데이터 필요).", file=sys.stderr)
+        print(f"ERROR: 원본 파일에 '{ind_sheet_name}' 시트가 없습니다.", file=sys.stderr)
         sys.exit(1)
 
     content = json.loads(Path(content_path).read_text(encoding="utf-8"))
 
-    if "투자판단 종합" in wb.sheetnames:
-        del wb["투자판단 종합"]
-    ws = wb.create_sheet("투자판단 종합")
+    if target_sheet_name in wb.sheetnames:
+        del wb[target_sheet_name]
+    ws = wb.create_sheet(target_sheet_name)
     ws.sheet_view.showGridLines = False
+
+    if period_mode == "quarterly":
+        ws.cell(row=1, column=1, value=(
+            "※ 본 시트는 분기 누적 공시를 연간 환산(FY_E)한 값을 기반으로 작성된 추정치입니다. "
+            "최신 분기가 완결된 사업연도가 아니면 예측 오차가 커질 수 있습니다."
+        )).font = NOTE_FONT
 
     # --- 상단: 회사명 / 종목코드 ---
     ws["B2"] = content.get("company_name", "")
@@ -217,7 +230,12 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     n_hist = len(hist_years)
 
     proj_years_n = int(content.get("projection_years", 10))
-    last_year = int(hist_years[-1][1]) if hist_years else None
+
+    def _extract_year(label) -> int | None:
+        m = re.match(r"(\d{4})", str(label))
+        return int(m.group(1)) if m else None
+
+    last_year = _extract_year(hist_years[-1][1]) if hist_years else None
     proj_years = [last_year + i for i in range(1, proj_years_n + 1)] if last_year else []
 
     def find_row_in_col_a(ws, label: str) -> int | None:
@@ -226,7 +244,7 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
                 return row[0].row
         return None
 
-    ia_sheet = wb["투자분석"] if "투자분석" in wb.sheetnames else None
+    ia_sheet = wb[ia_sheet_name] if ia_sheet_name in wb.sheetnames else None
     ia_row_map = {}
     if ia_sheet is not None:
         ia_row_map = {
@@ -249,10 +267,10 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
     idx_row = 39  # 연차 (연도보다 아래)
     year_row = 38  # 연도 (먼저 나옴)
     ws.cell(row=year_row, column=1, value="(억원)").font = NOTE_FONT
-    ws.cell(row=year_row, column=2, value="연도")
+    ws.cell(row=year_row, column=2, value="연도" if period_mode == "annual" else "기간")
     all_years = [y for _, y in hist_years] + proj_years
     for i, y in enumerate(all_years):
-        ws.cell(row=year_row, column=TABLE_START_COL + i, value=int(y))
+        ws.cell(row=year_row, column=TABLE_START_COL + i, value=y if isinstance(y, str) else int(y))
     ws.cell(row=idx_row, column=2, value="연차")
     for i, _ in enumerate(hist_years + [(None, y) for y in proj_years]):
         c = TABLE_START_COL + i
@@ -273,10 +291,10 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         for i in range(n_hist):
             col_letter = get_column_letter(TABLE_START_COL + i)
             ia_col = get_column_letter(3 + i)  # 투자분석 L섹션도 동일한 연도 순서로 C열부터 시작
-            ws[f"{col_letter}40"] = f"='투자분석'!{ia_col}{ia_row_map['시가총액']}"
-            ws[f"{col_letter}41"] = f"='투자분석'!{ia_col}{ia_row_map['종가']}"
-            ws[f"{col_letter}42"] = f"='투자분석'!{ia_col}{ia_row_map['PER(배)']}"
-            ws[f"{col_letter}43"] = f"='투자분석'!{ia_col}{ia_row_map['PBR(배)']}"
+            ws[f"{col_letter}40"] = f"='{ia_sheet_name}'!{ia_col}{ia_row_map['시가총액']}"
+            ws[f"{col_letter}41"] = f"='{ia_sheet_name}'!{ia_col}{ia_row_map['종가']}"
+            ws[f"{col_letter}42"] = f"='{ia_sheet_name}'!{ia_col}{ia_row_map['PER(배)']}"
+            ws[f"{col_letter}43"] = f"='{ia_sheet_name}'!{ia_col}{ia_row_map['PBR(배)']}"
             ws.cell(row=40, column=TABLE_START_COL + i).number_format = "#,##0.0"
             ws.cell(row=41, column=TABLE_START_COL + i).number_format = "#,##0"
             ws.cell(row=42, column=TABLE_START_COL + i).number_format = "0.0"
@@ -298,17 +316,17 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         if is_hist:
             src_col = get_column_letter(hist_years[i][0])
             if row_map["매출액"]:
-                ws[f"{col_letter}44"] = f"='지표_연간'!{src_col}{row_map['매출액']}"
+                ws[f"{col_letter}44"] = f"='{ind_sheet_name}'!{src_col}{row_map['매출액']}"
             if row_map["영업이익"]:
-                ws[f"{col_letter}46"] = f"='지표_연간'!{src_col}{row_map['영업이익']}"
+                ws[f"{col_letter}46"] = f"='{ind_sheet_name}'!{src_col}{row_map['영업이익']}"
             if row_map["당기순이익"]:
-                ws[f"{col_letter}49"] = f"='지표_연간'!{src_col}{row_map['당기순이익']}"
+                ws[f"{col_letter}49"] = f"='{ind_sheet_name}'!{src_col}{row_map['당기순이익']}"
             if row_map["자산총계"]:
-                ws[f"{col_letter}53"] = f"='지표_연간'!{src_col}{row_map['자산총계']}"
+                ws[f"{col_letter}53"] = f"='{ind_sheet_name}'!{src_col}{row_map['자산총계']}"
             if row_map["부채총계"]:
-                ws[f"{col_letter}54"] = f"='지표_연간'!{src_col}{row_map['부채총계']}"
+                ws[f"{col_letter}54"] = f"='{ind_sheet_name}'!{src_col}{row_map['부채총계']}"
             if row_map["자본총계"]:
-                ws[f"{col_letter}55"] = f"='지표_연간'!{src_col}{row_map['자본총계']}"
+                ws[f"{col_letter}55"] = f"='{ind_sheet_name}'!{src_col}{row_map['자본총계']}"
             ws[f"{col_letter}47"] = f"=IFERROR({col_letter}46/{col_letter}44,\"\")"
             ws[f"{col_letter}50"] = f"=IFERROR({col_letter}49/{col_letter}44,\"\")"
             ws[f"{col_letter}52"] = f"=IFERROR({col_letter}49/{col_letter}55,\"\")"
@@ -362,7 +380,8 @@ def build_thesis_sheet(src_path: str, content_path: str, outdir: str | None = No
         today = __import__("datetime").date.today().strftime("%Y%m%d")
         outdir_path = Path(outdir)
         outdir_path.mkdir(parents=True, exist_ok=True)
-        outfile = outdir_path / f"{content.get('company_name','기업')}_투자판단종합_{today}.xlsx"
+        suffix = "투자판단종합_분기추정" if period_mode == "quarterly" else "투자판단종합"
+        outfile = outdir_path / f"{content.get('company_name','기업')}_{suffix}_{today}.xlsx"
     wb.save(outfile)
     return str(outfile)
 
@@ -377,9 +396,21 @@ def main() -> None:
              "지정하지 않으면(기본값) src_xlsx 파일 자체에 시트를 추가해 덮어쓴다 "
              "— 재무제표+투자분석+투자판단 종합이 파일 하나로 합쳐진다.",
     )
+    ap.add_argument(
+        "--period", choices=["annual", "quarterly"], default="annual",
+        help="quarterly면 '지표_연환산'/'투자분석_분기추정'을 참조해 "
+             "'투자판단 종합_분기추정' 시트를 만든다(분기 연환산 워크북 대상).",
+    )
     args = ap.parse_args()
 
-    outfile = build_thesis_sheet(args.src_xlsx, args.content_json, args.outdir)
+    if args.period == "quarterly":
+        outfile = build_thesis_sheet(
+            args.src_xlsx, args.content_json, args.outdir,
+            ind_sheet_name="지표_연환산", ia_sheet_name="투자분석_분기추정",
+            target_sheet_name="투자판단 종합_분기추정", period_mode="quarterly",
+        )
+    else:
+        outfile = build_thesis_sheet(args.src_xlsx, args.content_json, args.outdir)
     print(json.dumps({"saved": outfile}, ensure_ascii=False))
 
 
