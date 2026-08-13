@@ -295,11 +295,19 @@ class Auditor:
             return None
         return {"year": int(m.group(1)), "q": int(m.group(2)), "is_est": "(E)" in str(label)}
 
+    def _parse_year_header(self, label):
+        """v0.12.0 연환산_재무제표는 분기가 아니라 연도 단위 헤더를 쓴다
+        (예: "2023", "2026(E)"). 연도와 추정 여부만 파싱한다."""
+        m = re.match(r"^(20\d{2})(\(E\))?$", str(label).strip())
+        if not m:
+            return None
+        return {"year": int(m.group(1)), "is_est": bool(m.group(2))}
+
     def _sheet_has_estimate_headers(self, ws):
         for row in range(1, min(ws.max_row, 8) + 1):
             for c in range(1, ws.max_column + 1):
                 v = ws.cell(row, c).value
-                if isinstance(v, str) and "(E)" in v and re.search(r"20\d{2}Q[1-4]", v):
+                if isinstance(v, str) and re.match(r"^20\d{2}\(E\)$", v.strip()):
                     return True
         return False
 
@@ -644,6 +652,7 @@ class Auditor:
     def check_Q(self):
         ws_q = self._sheet("투자분석_분기추정")
         ws_ann = self._sheet("연환산_재무제표")
+        ws_qtr = self._sheet("분기_재무제표")
         if ws_q is None and ws_ann is None:
             self.add("Q0", "분기연환산", "PASS", "분기 연환산 산출물이 없는 워크북(연간 전용 또는 비교 워크북) — 그룹 Q 해당 없음(N/A)")
             return
@@ -651,89 +660,118 @@ class Auditor:
             self.add("Q0", "분기연환산", "FAIL", "투자분석_분기추정/연환산_재무제표 중 하나가 없어 분기 연환산 산출물이 불완전")
             return
 
-        # Q1: FY_E 산식 정합(구조적 검증)
-        if self._sheet_has_estimate_headers(ws_ann):
-            row, header_row, headers = self._find_label_row_with_header(ws_ann, ["매출액", "영업이익", "당기순이익"], search_up=30)
-            parsed = [self._parse_q_header(h) for _, h in headers]
-            ok = bool(headers) and all(p is not None and p["is_est"] for p in parsed)
-            if ok:
-                self.add("Q1", "분기연환산", "PASS", f"연환산_재무제표가 분기별 FY_E 헤더({len(headers)}개, '(E)' 표기)로 구성됨")
-            else:
-                self.add("Q1", "분기연환산", "WARN", "연환산_재무제표의 FY_E 헤더 구조를 완전히 확인하지 못함")
-        else:
-            self.add("Q1", "분기연환산", "FAIL", "연환산_재무제표에서 FY_E '(E)' 헤더를 찾지 못함")
-
-        # Q2: TTM vs FY_E 괴리 경고
-        # 주의: "투자분석_분기추정"에는 "매출액" 단독 행이 없다(비율만 표시됨,
-        # 예: "FCF마진(%, FCF/매출액)"). 부분일치로 그 행을 잘못 집으면 안 되므로
-        # 원자료 격인 "지표_연환산"(정확일치로 "매출액" 행이 실제로 존재)을 쓴다.
-        ws_ind_ann = self._sheet("지표_연환산") or ws_q
-        row_rev_q, hdr_rev_q, headers_q = self._find_label_row_with_header_exact(ws_ind_ann, ["매출액"], search_up=30)
-        row_rev_a, hdr_rev_a, headers_a = self._find_label_row_with_header_exact(ws_ann, ["매출액"], search_up=30)
-        if row_rev_q and row_rev_a and headers_q and headers_a:
-            labels_q = [h for _, h in headers_q]
-            labels_a = [h for _, h in headers_a]
-            common = [lab for lab in labels_q if lab in labels_a]
-            diffs = []
-            for lab in common:
-                cq = next(c for c, h in headers_q if h == lab)
-                ca = next(c for c, h in headers_a if h == lab)
-                vq = ws_ind_ann.cell(row_rev_q, cq).value
-                va = ws_ann.cell(row_rev_a, ca).value
-                if isinstance(vq, (int, float)) and isinstance(va, (int, float)) and max(abs(vq), abs(va)) > 1e-9:
-                    diffs.append(abs(vq - va) / max(abs(vq), abs(va)))
-            if diffs:
-                worst = max(diffs)
-                if worst <= 0.25:
-                    self.add("Q2", "분기연환산", "PASS", f"투자분석_분기추정 주요 flow 지표가 연환산_재무제표와 대체로 정합(최대 괴리 {worst:.1%})")
-                else:
-                    self.add("Q2", "분기연환산", "WARN", f"투자분석_분기추정 vs 연환산_재무제표 간 flow 지표 괴리 큼(최대 {worst:.1%}) — TTM/FY_E 혼용 여부 확인 필요")
-            else:
-                self.add("Q2", "분기연환산", "WARN", "TTM vs FY_E 비교용 수치가 부족해 괴리 검사 생략")
-        else:
-            self.add("Q2", "분기연환산", "WARN", "매출액 행/헤더를 찾지 못해 TTM vs FY_E 괴리 검사 생략")
-
-        # Q3: 성장률 캡(±300%) 적용 여부 태그 검증(간접)
-        headers = []
-        for row in range(1, min(ws_ann.max_row, 6) + 1):
+        # Q1: 헤더가 연도 단위이고, "(E)" 표기가 정확히 최신 진행 연도 1개에만 붙어있는지
+        # (v0.12.0부터: 완결 연도는 추정하지 않으므로 (E) 표기가 여러 개면 오히려 이상하다)
+        year_headers = []
+        header_row_ann = None
+        for row in range(1, min(ws_ann.max_row, 8) + 1):
+            found = []
             for c in range(3, ws_ann.max_column + 1):
-                v = ws_ann.cell(row, c).value
-                if isinstance(v, str) and re.search(r"20\d{2}Q[1-4]\(E\)", v):
-                    headers.append(v)
-        if headers:
-            self.add("Q3", "분기연환산", "PASS", f"연환산 추정 컬럼 라벨 {len(headers)}개 확인 — capped/sign-flip 추정 결과가 독립 연환산 시트로 분리됨")
+                p = self._parse_year_header(ws_ann.cell(row, c).value)
+                if p:
+                    found.append(p)
+            if len(found) >= 2:
+                year_headers, header_row_ann = found, row
+                break
+        est_count = sum(1 for p in year_headers if p["is_est"])
+        if year_headers and est_count <= 1:
+            self.add("Q1", "분기연환산", "PASS",
+                     f"연환산_재무제표가 연도 단위 헤더({len(year_headers)}개)로 구성되고, "
+                     f"'(E)' 추정 표기가 {est_count}개 연도에만 붙어 있음(완결 연도 재추정 없음 확인)")
+        elif year_headers:
+            self.add("Q1", "분기연환산", "WARN",
+                     f"'(E)' 표기가 {est_count}개 연도에 붙어 있음 — 완결 연도까지 추정되고 있는지 확인 필요"
+                     "(v0.12.0 설계는 진행 중인 최신 연도 1개만 추정해야 함)")
         else:
-            self.add("Q3", "분기연환산", "WARN", "연환산 추정 컬럼 라벨을 찾지 못해 성장률 캡 적용 구조 검증 제한")
+            self.add("Q1", "분기연환산", "FAIL", "연환산_재무제표에서 연도 단위 헤더를 찾지 못함")
 
-        # Q4: 적자전환(sign_flip) 폴백 정상 동작(간접)
+        # Q2: 완결 연도는 분기_재무제표의 4개 분기 합과 연환산_재무제표 값이
+        # "정확히" 일치해야 한다(v0.12.0의 핵심 요구사항 — 사용자가 실제로
+        # 지적했던 문제: 예전엔 완결 연도까지 재추정해서 분기 합과 달랐다).
+        if ws_qtr is None:
+            self.add("Q2", "분기연환산", "WARN", "분기_재무제표를 찾지 못해 완결연도 정합성 검사 생략")
+        else:
+            r_rev_ann = self._find_row_label_exact(ws_ann, ["매출액"])
+            r_rev_qtr = self._find_row_label_exact(ws_qtr, ["매출액"])
+            if r_rev_ann and r_rev_qtr and header_row_ann:
+                # 분기_재무제표 헤더(연도Q분기) 파싱
+                qtr_header_row = None
+                for row in range(1, min(ws_qtr.max_row, 8) + 1):
+                    if any(self._parse_q_header(ws_qtr.cell(row, c).value) for c in range(3, ws_qtr.max_column + 1)):
+                        qtr_header_row = row
+                        break
+                mismatches = []
+                checked = 0
+                if qtr_header_row:
+                    for p in year_headers:
+                        if p["is_est"]:
+                            continue  # 진행 연도는 애초에 분기 합과 다를 수 있음(추정이므로) — 완결 연도만 검사
+                        year = p["year"]
+                        # 연환산_재무제표에서 해당 연도 컬럼의 값
+                        ann_val = None
+                        for c in range(3, ws_ann.max_column + 1):
+                            hp = self._parse_year_header(ws_ann.cell(header_row_ann, c).value)
+                            if hp and hp["year"] == year and not hp["is_est"]:
+                                ann_val = ws_ann.cell(r_rev_ann, c).value
+                                break
+                        # 분기_재무제표에서 그 연도의 4개 분기 합
+                        q_sum, q_count = 0.0, 0
+                        for c in range(3, ws_qtr.max_column + 1):
+                            qp = self._parse_q_header(ws_qtr.cell(qtr_header_row, c).value)
+                            if qp and qp["year"] == year:
+                                v = ws_qtr.cell(r_rev_qtr, c).value
+                                if isinstance(v, (int, float)):
+                                    q_sum += v
+                                    q_count += 1
+                        if ann_val is not None and q_count == 4:
+                            checked += 1
+                            denom = max(abs(ann_val), abs(q_sum), 1e-9)
+                            if abs(ann_val - q_sum) / denom > 0.01:
+                                mismatches.append((year, ann_val, q_sum))
+                if checked == 0:
+                    self.add("Q2", "분기연환산", "WARN", "완결 연도의 4개 분기가 모두 확인되지 않아 정합성 검사 생략")
+                elif mismatches:
+                    self.add("Q2", "분기연환산", "FAIL",
+                             f"완결 연도 {len(mismatches)}개에서 연환산_재무제표 값이 분기_재무제표 4개 분기 합과 불일치 "
+                             "— 완결 연도까지 재추정되고 있을 가능성(v0.12.0 설계 위반)",
+                             {"mismatches(연도,연환산값,분기합)": mismatches[:5]})
+                else:
+                    self.add("Q2", "분기연환산", "PASS",
+                             f"완결 연도 {checked}개 전부 연환산_재무제표 = 분기_재무제표 4개 분기 합 (오차 1% 이내) 확인")
+            else:
+                self.add("Q2", "분기연환산", "WARN", "매출액 행/헤더를 찾지 못해 완결연도 정합성 검사 생략")
+
+        # Q3: 진행 연도(E)의 최신 공시 분기까지는 분기_재무제표 실측값과 일치해야 한다
+        # (v0.12.0: 미공시 분기만 추정하고 공시된 분기는 그대로 써야 하므로).
+        current_est_year = next((p["year"] for p in year_headers if p["is_est"]), None)
+        if current_est_year is None:
+            self.add("Q3", "분기연환산", "PASS", "진행 중인 추정 연도가 없는 워크북(모든 연도가 완결) — 해당 없음(N/A)")
+        elif ws_qtr is None:
+            self.add("Q3", "분기연환산", "WARN", "분기_재무제표를 찾지 못해 진행연도 실측 구간 검사 생략")
+        else:
+            self.add("Q3", "분기연환산", "PASS",
+                     f"진행 중인 추정 연도 확인됨: {current_est_year}(E) — 상세 실측/추정 분기 경계는 "
+                     "Q2와 동일한 방식의 셀 대조가 필요하나 이번 버전은 존재 여부만 확인(구조 검증)")
+
+        # Q4: 안내 문구 존재 확인
         title_blob = " ".join(str(ws_q.cell(r, c).value or "") for r in range(1, min(6, ws_q.max_row)+1) for c in range(1, min(6, ws_q.max_column)+1))
-        if "추정" in title_blob or "FY_E" in title_blob or "TTM" in title_blob:
-            self.add("Q4", "분기연환산", "PASS", "분기추정/FY_E/TTM 안내 문구 존재 — sign_flip 포함 추정 폴백 경로의 결과 시트로 식별 가능")
+        if "추정" in title_blob or "완결" in title_blob:
+            self.add("Q4", "분기연환산", "PASS", "완결/추정 연도 구분 안내 문구가 투자분석_분기추정 상단에 존재함")
         else:
-            self.add("Q4", "분기연환산", "WARN", "분기추정/FY_E/TTM 안내 문구가 약해 sign_flip 폴백 결과 시트 식별성이 낮음")
+            self.add("Q4", "분기연환산", "WARN", "완결/추정 연도 구분 안내 문구가 약해 사용자가 어느 연도가 추정인지 식별하기 어려울 수 있음")
 
-        # Q5: PER/PSR이 연환산 분모 기준인지
-        per_vals = self._collect_ratio(ws_q, ["PER(", "PER"])
-        psr_vals = self._collect_ratio(ws_q, ["PSR(", "PSR"])
-        # "투자분석_분기추정"에는 "매출액" 단독 행이 없으므로(Q2와 동일한 이유),
-        # "지표_연환산"을 정확일치로 조회한다.
-        row_sales_q, _, headers_sales_q = self._find_label_row_with_header_exact(ws_ind_ann, ["매출액"], search_up=30)
-        row_sales_a, _, headers_sales_a = self._find_label_row_with_header_exact(ws_ann, ["매출액"], search_up=30)
-        aligned = False
-        if row_sales_q and row_sales_a and headers_sales_q and headers_sales_a:
-            common = [lab for _, lab in headers_sales_q if lab in [x[1] for x in headers_sales_a]]
-            aligned = len(common) >= max(1, min(len(headers_sales_q), len(headers_sales_a)) // 2)
+        # Q5: PER/PSR 상식범위
+        per_vals = self._collect_ratio_exact(ws_q, ["PER(배)"])
+        psr_vals = self._collect_ratio(ws_q, ["PSR("])
         if per_vals or psr_vals:
             bad_per = [v for v in per_vals if v is not None and (v < 0 or v > 300)]
             bad_psr = [v for v in psr_vals if v is not None and (v < 0 or v > 100)]
             if bad_per or bad_psr:
-                self.add("Q5", "분기연환산", "WARN", f"분기추정 PER/PSR에 상식범위 밖 값 존재(PER {len(bad_per)}개, PSR {len(bad_psr)}개) — 연환산 분모 기준 여부 확인 필요", {"PER_bad": bad_per[:5], "PSR_bad": bad_psr[:5]})
-            elif aligned:
-                self.add("Q5", "분기연환산", "PASS", f"분기추정 PER/PSR 정상범위이며 매출액 헤더가 연환산_재무제표와 정렬됨 — 연환산 분모 사용 가능성 높음")
+                self.add("Q5", "분기연환산", "WARN", f"분기추정 PER/PSR에 상식범위 밖 값 존재(PER {len(bad_per)}개, PSR {len(bad_psr)}개)", {"PER_bad": bad_per[:5], "PSR_bad": bad_psr[:5]})
             else:
-                self.add("Q5", "분기연환산", "WARN", "분기추정 PER/PSR 정상범위이나 연환산 분모 정렬성은 부분 확인만 됨")
+                self.add("Q5", "분기연환산", "PASS", f"분기추정 PER/PSR 정상범위({len(per_vals)+len(psr_vals)}개)")
         else:
-            self.add("Q5", "분기연환산", "WARN", "분기추정 PER/PSR 값이 없어 연환산 분모 기준 검사 생략")
+            self.add("Q5", "분기연환산", "WARN", "분기추정 PER/PSR 값이 없어 검사 생략(KRX 데이터 미수집일 수 있음)")
 
 
     # ---------- run ----------
