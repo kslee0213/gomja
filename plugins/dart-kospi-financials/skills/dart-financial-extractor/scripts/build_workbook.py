@@ -961,240 +961,8 @@ def _fmt_num(v):
 
 
 
-# ===========================================================================
-# 분기 연환산(annualization) 코어 — v0.12.0 (단순화 재설계)
-# ---------------------------------------------------------------------------
-# v0.11.0의 방식(모든 연도를 YoY로 재추정, 성장배수 캡·sign-flip·TTM 등)은
-# 과거 이미 확정된 실적까지 다시 "추정"해서 분기_재무제표 값과 안 맞는 문제가
-# 있었다. v0.12.0은 사용자 요청대로 훨씬 단순한 규칙으로 바꿨다:
-#   - 사업보고서(FY)가 이미 공시된 "완결 연도"는 추정하지 않고 실적 그대로 쓴다.
-#   - 아직 사업보고서가 없는 "진행 중인 연도"(최신 연도, 예: 2026년)만:
-#       · 이미 공시된 분기(예: 2026Q1)까지는 실측값 그대로.
-#       · 아직 공시 안 된 분기(예: 2026Q2~Q4)는 "당해 최신 공시 분기의 전년
-#         동기 대비 증감율" 하나를 계산해서, 그 비율을 전년도의 해당 분기
-#         실적에 곱해 추정한다.
-#         예: 2026Q1이 2025Q1 대비 +50%면, 2026Q2(추정)=2025Q2×1.5,
-#             2026Q3(추정)=2025Q3×1.5, 2026Q4(추정)=2025Q4×1.5.
-#       · 진행 중인 연도의 연간(E) = 실측 분기 합 + 위 추정 분기 합.
-#   - BS(자산·부채·자본 등 잔액) 계정은 애초에 "연간 합산" 개념이 아니라 특정
-#     시점의 잔액이므로, 진행 중인 연도는 "가장 최근 공시된 분기말 잔액"을
-#     그대로 쓴다(추정하지 않음).
-# ===========================================================================
 
-
-def _quarter_standalone_value(p: dict | None, sj: str, aid: str) -> float | None:
-    """quarter_plan의 한 엔트리(p)에 대해 그 분기 '단독'(누적 아님) 실측값을
-    반환한다. build_quarterly_sheet의 Q1/Q2/Q3/Q4 유도 규칙과 동일한 방식을
-    셀 수식이 아니라 파이썬 값 레벨로 재현한 것이다(N섹션 등급 계산용)."""
-    if not p:
-        return None
-    q = p.get("q")
-    if q == 1:
-        return amount_lookup(p.get("q1"), sj, aid, "thstrm_amount")
-    if q == 2:
-        h1 = amount_lookup(p.get("h1"), sj, aid, "thstrm_amount")
-        q1 = amount_lookup(p.get("q1"), sj, aid, "thstrm_amount")
-        return (h1 - q1) if (h1 is not None and q1 is not None) else None
-    if q == 3:
-        v = amount_lookup(p.get("q3"), sj, aid, "thstrm_amount")
-        if v is not None:
-            return v
-        # 3분기보고서 단독 필드가 없는(현금흐름표 등) 회사 대비: 9개월 누적 - 반기 누적
-        q3_add = amount_lookup(p.get("q3"), sj, aid, "thstrm_add_amount")
-        h1 = amount_lookup(p.get("h1"), sj, aid, "thstrm_amount")
-        return (q3_add - h1) if (q3_add is not None and h1 is not None) else None
-    if q == 4:
-        fy = amount_lookup(p.get("fy"), sj, aid, "thstrm_amount")
-        q3_add = amount_lookup(p.get("q3"), sj, aid, "thstrm_add_amount")
-        return (fy - q3_add) if (fy is not None and q3_add is not None) else None
-    return None
-
-
-def _progress_year_formula(
-    sj: str, aid: str, current_year: str, latest_filed_q: int,
-    q_col_of: dict, q_row_map: dict,
-) -> str | None:
-    """진행 중인 연도(flow 계정)의 연간(E) 추정 수식 문자열을 만든다
-    (분기_재무제표 셀을 참조하는 실제 엑셀 수식 — 감사 가능).
-    = 실측 1~latest_filed_q분기 합 + Σ[전년동기 실적 × (당해 최신분기 ÷ 전년 동기)]
-    """
-    r = q_row_map.get((sj, aid))
-    if r is None:
-        return None
-    prior_year = str(int(current_year) - 1)
-
-    def cellref(year: str, q: int) -> str | None:
-        col = q_col_of.get((year, q))
-        return f"'분기_재무제표'!{get_column_letter(col)}{r}" if col else None
-
-    actual_terms = [cellref(current_year, q) for q in range(1, latest_filed_q + 1)]
-    actual_terms = [t for t in actual_terms if t]
-    if not actual_terms:
-        return None
-
-    cur_latest_ref = cellref(current_year, latest_filed_q)
-    prior_latest_ref = cellref(prior_year, latest_filed_q)
-    if not (cur_latest_ref and prior_latest_ref):
-        # 전년 동기 데이터가 없어 비율을 못 구하면, 지어내지 않고 실측 분기 합만 반환한다.
-        return "=" + "+".join(actual_terms)
-
-    ratio_expr = f"IFERROR({cur_latest_ref}/{prior_latest_ref},1)"
-    est_terms = []
-    for q in range(latest_filed_q + 1, 5):
-        prior_ref = cellref(prior_year, q)
-        if prior_ref:
-            est_terms.append(f"({prior_ref}*({ratio_expr}))")
-
-    return "=" + "+".join(actual_terms + est_terms)
-
-
-def build_annualized_estimate_sheet(
-    wb: Workbook, quarter_plan: list[dict], reports: dict, cell_index: dict,
-    q_row_map: dict, q_name_map: dict, year_list: list[str],
-    sheet_name: str = "연환산_재무제표", hidden: bool = True,
-):
-    """분기 워크북용 "연간 추정" 재무제표를 만든다. 완결 연도는 사업보고서
-    실적 그대로(수식으로 원본데이터 참조), 진행 중인 최신 연도만 위 규칙으로
-    추정한다. 반환 형태는 build_annual_sheet와 동일하게 맞춰서
-    build_indicator_sheet/build_investment_analysis_sheet가 그대로 재사용
-    가능하게 한다: (account_row_map, account_name_map, period_labels).
-    그 외에 (current_year, latest_filed_q)도 함께 반환해 N섹션 등급 계산의
-    파이썬 레벨 추정(annualized_series)에 재사용한다."""
-    ws = wb.create_sheet(sheet_name)
-    if hidden:
-        ws.sheet_state = "hidden"
-    ws["A1"] = (
-        "단위: 억원 | 완결 연도는 사업보고서 실적 그대로, 최신 진행 연도(E)만 "
-        "전년 동기 대비 증감율로 미공시 분기를 추정했습니다."
-    )
-    ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
-
-    years_in_qplan = sorted({p["year"] for p in quarter_plan})
-    complete_years_in_qplan = [y for y in years_in_qplan if "11011" in reports.get(y, {})]
-    partial_years = [y for y in years_in_qplan if y not in complete_years_in_qplan]
-    current_year = max(partial_years) if partial_years else None
-    latest_filed_q = None
-    if current_year:
-        qs = [p["q"] for p in quarter_plan if p["year"] == current_year]
-        latest_filed_q = max(qs) if qs else None
-
-    all_years = sorted(set(year_list) | ({current_year} if current_year else set()))
-    labels = [f"{y}(E)" if y == current_year else y for y in all_years]
-
-    header_row = 3
-    ws.cell(row=header_row, column=1, value="구분")
-    ws.cell(row=header_row, column=2, value="계정과목")
-    for i, lab in enumerate(labels):
-        ws.cell(row=header_row, column=3 + i, value=lab)
-    style_header(ws, header_row, 2 + len(all_years))
-
-    q_col_of = {(p["year"], p["q"]): 3 + i for i, p in enumerate(quarter_plan)}
-
-    account_row_map: dict[tuple[str, str], int] = {}
-    account_name_map: dict[tuple[str, str], str] = {}
-
-    row = header_row + 1
-    complete_years_for_lookup = [y for y in all_years if y != current_year]
-    fy_periods = [{"fy": reports.get(y, {}).get("11011")} for y in complete_years_for_lookup]
-    for sj_div, sj_name in SJ_ORDER:
-        accs_fy = collect_accounts(fy_periods, sj_div, lambda p: p.get("fy")) if fy_periods else []
-        seen_ids = {a["account_id"] for a in accs_fy}
-        # 분기_재무제표에는 있는데(진행연도에서만 쓰는 계정 등) 완결연도 목록엔
-        # 없는 계정도 함께 포함한다(존재하는데 표에서 누락되는 것 방지).
-        accs_extra = [
-            {"account_id": aid, "account_nm": q_name_map[(sj, aid)]}
-            for (sj, aid) in q_row_map if sj == sj_div and aid not in seen_ids
-        ]
-        accounts = accs_fy + accs_extra
-        if not accounts:
-            continue
-        ws.cell(row=row, column=1, value=sj_name).font = BOLD
-        row += 1
-        for acc in accounts:
-            aid = acc["account_id"]
-            account_row_map[(sj_div, aid)] = row
-            account_name_map[(sj_div, aid)] = acc["account_nm"]
-            ws.cell(row=row, column=2, value=acc["account_nm"])
-            is_bs = (sj_div == "BS")
-            for i, y in enumerate(all_years):
-                col = 3 + i
-                cell = ws.cell(row=row, column=col)
-                if y != current_year:
-                    ref = cell_index.get((sj_div, aid, f"{y}_사업보고서", "thstrm_amount"))
-                    if ref:
-                        cell.value = f"={ref}"
-                        cell.font = GREEN
-                elif is_bs:
-                    q_col = q_col_of.get((current_year, latest_filed_q)) if latest_filed_q else None
-                    if q_col:
-                        src_col = get_column_letter(q_col)
-                        cell.value = f"='분기_재무제표'!{src_col}{q_row_map.get((sj_div, aid), '')}"
-                        cell.font = BLUE
-                elif latest_filed_q:
-                    formula = _progress_year_formula(sj_div, aid, current_year, latest_filed_q, q_col_of, q_row_map)
-                    if formula:
-                        cell.value = formula
-                        cell.font = BLUE
-                cell.number_format = "#,##0.0;(#,##0.0);-"
-            row += 1
-        row += 1
-
-    ws.column_dimensions["A"].width = 16
-    ws.column_dimensions["B"].width = 32
-    for i in range(len(all_years)):
-        ws.column_dimensions[get_column_letter(3 + i)].width = 18
-    ws.freeze_panes = "C4"
-    apply_grid_border(ws, header_row, row - 1, 1, 2 + len(all_years))
-
-    return account_row_map, account_name_map, labels, current_year, latest_filed_q
-
-
-def compute_progress_year_series(
-    reports: dict, quarter_plan: list[dict], current_year: str | None, latest_filed_q: int | None,
-    keys_hits: dict,
-) -> dict:
-    """N섹션(투자판단 자동평가) 등급 계산용: 진행 중인 연도의 flow 계정
-    연간(E) 추정치를 파이썬 값으로 재계산한다(연환산_재무제표의 수식과 동일한
-    로직, 값 레벨 재현). 반환: {key: {current_year: 추정치(원 단위)}}"""
-    result: dict[str, dict[str, float]] = {}
-    if not current_year or not latest_filed_q:
-        return result
-    prior_year = str(int(current_year) - 1)
-    plan_by_yq = {(p["year"], p["q"]): p for p in quarter_plan}
-
-    for key, hit in keys_hits.items():
-        if hit is None:
-            continue
-        sj, aid = hit
-        if sj == "BS":
-            # 잔액(stock) 계정은 합산 대상이 아니라 "최신 공시 분기말 잔액"을 그대로 쓴다.
-            p = plan_by_yq.get((current_year, latest_filed_q))
-            data = (p or {}).get("fy") or (p or {}).get("q3") or (p or {}).get("h1") or (p or {}).get("q1")
-            v = amount_lookup(data, sj, aid, "thstrm_amount")
-            if v is not None:
-                result[key] = {current_year: v}
-            continue
-        actual_sum, got_actual = 0.0, False
-        for q in range(1, latest_filed_q + 1):
-            v = _quarter_standalone_value(plan_by_yq.get((current_year, q)), sj, aid)
-            if v is not None:
-                actual_sum += v
-                got_actual = True
-        if not got_actual:
-            continue
-        cur_latest = _quarter_standalone_value(plan_by_yq.get((current_year, latest_filed_q)), sj, aid)
-        prior_latest = _quarter_standalone_value(plan_by_yq.get((prior_year, latest_filed_q)), sj, aid)
-        ratio = (cur_latest / prior_latest) if (cur_latest is not None and prior_latest not in (None, 0)) else None
-        est_sum = 0.0
-        if ratio is not None:
-            for q in range(latest_filed_q + 1, 5):
-                pv = _quarter_standalone_value(plan_by_yq.get((prior_year, q)), sj, aid)
-                if pv is not None:
-                    est_sum += pv * ratio
-        result[key] = {current_year: actual_sum + est_sum}
-    return result
-
-
+# (v0.13.0: 분기 연환산 관련 코드 전부 제거 — 사용자 요청으로 원복)
 
 def build_investment_analysis_sheet(
     wb: Workbook,
@@ -2182,16 +1950,6 @@ def main() -> None:
     year_list = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years] if want_annual else []
     year_list.sort()  # 오래된 -> 최근
 
-    # 분기 연환산(투자분석_분기추정)에 필요한 "완결 연도" 목록. quarter_plan이
-    # 커버하는 기간(예: 12분기≈3개년)보다 투자분석이 원하는 연도 수(args.years,
-    # 기본 5)가 더 길 수 있으므로, year_list와 별개로 최근 완결 연도를 넉넉히 챙긴다.
-    ann_year_list: list[str] = []
-    if want_quarterly:
-        all_complete_years = sorted([y for y in reports if "11011" in reports[y]], reverse=True)
-        has_partial_current_year = bool(quarter_plan) and quarter_plan[-1]["year"] not in all_complete_years
-        n_needed = max(args.years - 1, 1) if has_partial_current_year else args.years
-        ann_year_list = sorted(all_complete_years[:n_needed])
-
     if want_quarterly and len(quarter_plan) < args.quarters:
         print(
             f"WARNING: 요청한 {args.quarters}분기 중 {len(quarter_plan)}분기만 채웠습니다 "
@@ -2207,11 +1965,7 @@ def main() -> None:
     wb = Workbook()
     wb.remove(wb.active)
 
-    # write_raw_sheet에는 연간 모드의 year_list와 분기 연환산용 ann_year_list를
-    # 합쳐서 넘긴다 — 그래야 완결 연도의 사업보고서 원자료가 원본데이터에 실려
-    # 연환산_재무제표가 그 값을 수식으로 참조할 수 있다.
-    year_list_for_raw = sorted(set(year_list) | set(ann_year_list))
-    cell_index = write_raw_sheet(wb, quarter_plan, year_list_for_raw, reports)
+    cell_index = write_raw_sheet(wb, quarter_plan, year_list, reports)
 
     all_missing: dict[str, list[str]] = {}
     if quarter_plan:
@@ -2225,47 +1979,6 @@ def main() -> None:
         )
         if q_missing:
             all_missing["분기"] = q_missing
-
-        q_ann_row_map, q_ann_name_map, q_ann_labels, current_year, latest_filed_q = build_annualized_estimate_sheet(
-            wb, quarter_plan, reports, cell_index, q_row_map, q_name_map, ann_year_list,
-            sheet_name="연환산_재무제표", hidden=True,
-        )
-        q_ann_ind_sheet, q_ann_row_of, q_ann_missing = build_indicator_sheet(
-            wb, "연환산", "연환산_재무제표", q_ann_labels, q_ann_row_map, q_ann_name_map, sheet_name="지표_연환산"
-        )
-        build_chart_sheet(
-            wb, "연환산", q_ann_ind_sheet, q_ann_row_of, len(q_ann_labels),
-            embed_anchor_col=get_column_letter(2 + len(q_ann_labels) + 2),
-        )
-        if q_ann_missing:
-            all_missing["연환산"] = q_ann_missing
-
-        # N섹션(투자판단 자동평가)용: 진행 중인 연도만 파이썬 레벨로 동일 로직 재계산.
-        # (완결 연도는 series()가 사업보고서 원자료에서 자동으로 잘 찾으므로 손댈 필요 없음)
-        progress_keys = ["매출액", "영업이익", "당기순이익", "자산총계", "자본총계", "부채총계", "유동자산", "유동부채"]
-        keys_hits = {k: resolve_metric(k, q_ann_row_map, q_ann_name_map) for k in progress_keys}
-        ann_series = compute_progress_year_series(reports, quarter_plan, current_year, latest_filed_q, keys_hits)
-
-        q_year_list = list(dict.fromkeys([y for y in ann_year_list] + ([current_year] if current_year else [])))
-        # period_dates: N섹션의 KRX 가격 조회 기준일 — 완결 연도는 연말(12/31),
-        # 진행 중인 연도는 "가장 최근 공시된 분기말" 날짜를 쓴다(그 날짜 기준
-        # 시가총액이어야 PER/PBR이 그 시점 추정 실적과 짝이 맞는다).
-        _q_end = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
-        q_period_dates = [
-            f"{y}{_q_end[latest_filed_q]}" if (y == current_year and latest_filed_q) else f"{y}1231"
-            for y in q_year_list
-        ]
-
-        banner = "※ 본 시트는 완결 연도는 사업보고서 실적 그대로, 최신 진행 연도(E)만 전년 동기 대비 증감율로 미공시 분기를 추정한 투자분석입니다."
-        ia_q_warnings = build_investment_analysis_sheet(
-            wb, args.company_name, args.corp_code, q_ann_labels, q_year_list,
-            q_ann_row_map, q_ann_name_map, q_ann_ind_sheet, q_ann_row_of, reports,
-            sheet_title="투자분석_분기추정", source_flow_sheet="연환산_재무제표",
-            period_dates=q_period_dates, annualized_series=ann_series,
-            banner=banner,
-        )
-        if ia_q_warnings:
-            all_missing["투자분석_분기추정(계정 매칭 실패)"] = ia_q_warnings
 
     if year_list:
         y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
@@ -2288,10 +2001,10 @@ def main() -> None:
 
     # 시트 순서 고정
     desired_order = [
-        "분기_재무제표", "연간_재무제표", "연환산_재무제표",
+        "분기_재무제표", "연간_재무제표",
         "지표_분기",
-        "지표_연간", "지표_연환산",
-        "투자분석", "투자분석_분기추정",
+        "지표_연간",
+        "투자분석",
         "원본데이터",
     ]
     wb._sheets = [wb[name] for name in desired_order if name in wb.sheetnames]
