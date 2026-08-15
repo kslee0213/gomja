@@ -16,7 +16,7 @@ description: >
   (오너 어닝, 그레이엄 내재가치·안전마진, 시장 내재 기대성장률 역산, ROIC vs WACC,
   다년도 DCF 내재가치 계산기, 경제적 해자 체크리스트).
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
 ---
 
 # 투자판단 종합 시트 작성
@@ -25,7 +25,7 @@ metadata:
 
 ## 언제 이 스킬을 쓰는가
 
-- 사용자가 이미 `dart-financial-extractor`로 "OO 년 분석해줘"(또는 v0.11.0부터 "OO 분기 분석해줘")를 실행해서 "투자분석"(또는 "투자분석_분기추정") 시트가 있는 xlsx 파일을 갖고 있어야 한다. 없으면 먼저 그 스킬로 만들라고 안내한다.
+- 사용자가 이미 `dart-financial-extractor`로 "OO 년 분석해줘"를 실행해서 "투자분석" 시트가 있는 xlsx 파일을 갖고 있어야 한다. 없으면 먼저 그 스킬로 만들라고 안내한다.
 - "투자판단 종합", "사업역량", "경쟁우위", "투자 스토리" 같은 요청이 오면 이 스킬을 쓴다.
 
 ## 0. 사전 준비
@@ -33,7 +33,7 @@ metadata:
 | 항목 | 내용 |
 |---|---|
 | `DART_API_KEY` | 사업의 내용 원문 조회에 필요. 이미 대화에 있으면 재사용, 없으면 요청. |
-| 원본 xlsx 경로 | 이미 만들어진 "OO_연간_YYYYMMDD.xlsx"(또는 "OO_분기_YYYYMMDD.xlsx") 파일 경로. 사용자가 최근에 만들었으면 그 파일을 그대로 쓰고, 없으면 먼저 `dart-financial-extractor`의 절차로 만든다. **원본 파일이 연간인지 분기인지에 따라 아래 스크립트 실행 시 `--period` 옵션을 맞춰야 한다** (자세한 건 6번 섹션과 "v1.5.0" 변경사항 참고). |
+| 원본 xlsx 경로 | 이미 만들어진 "OO_연간_YYYYMMDD.xlsx" 파일 경로. 사용자가 최근에 만들었으면 그 파일을 그대로 쓰고, 없으면 먼저 `dart-financial-extractor`의 절차로 만든다. |
 
 ## 1. DART 사업의 내용 원문 수집
 
@@ -134,21 +134,9 @@ python skills/investment-thesis-writer/scripts/build_valuation_sheet.py <xlsx �
 
 ## 참고
 
-### v1.5.0 (분기 연환산 모드 지원)
+### v1.6.0 (분기 연환산 모드 지원 제거 — 사용자 요청으로 원복)
 
-`dart-financial-extractor`가 v0.11.0부터 분기 워크북에도 "투자분석_분기추정"(연환산 FY_E 기반) 시트를 만들게 되면서, 이 스킬의 두 스크립트(`build_thesis_sheet.py`, `build_valuation_sheet.py`)도 그 시트를 대상으로 "투자판단 종합"/"버핏멍거_가치평가"를 만들 수 있도록 확장했다.
-
-**사용법**: `--period quarterly` 옵션 하나만 추가하면 된다.
-
-```
-python skills/investment-thesis-writer/scripts/build_thesis_sheet.py <분기 워크북.xlsx> content.json --period quarterly
-python skills/investment-thesis-writer/scripts/build_valuation_sheet.py <분기 워크북.xlsx> content.json --period quarterly
-```
-
-- `--period quarterly`를 주면 소스를 `지표_연간`/`투자분석` 대신 `지표_연환산`/`투자분석_분기추정`에서 찾고, 결과 시트 이름도 "투자판단 종합_분기추정"/"버핏멍거_가치평가_분기추정"으로 만든다. **연간 워크북에 `--period quarterly`를 잘못 붙이거나 그 반대로 하면 시트를 못 찾아 에러가 난다** — 반드시 워크북의 실제 시트 구성에 맞는 옵션을 써야 한다.
-- 재무추세표(`build_thesis_sheet.py`)의 연도 라벨이 분기 모드에서는 "2023Q1(E)" 같은 형식이 되므로, 표 상단 라벨이 "연도" 대신 "기간"으로 자동 바뀐다.
-- **CAGR 계산에 주의**: 실제 순이익 CAGR(`build_valuation_sheet.py`)을 몇 개년으로 나눠 연복리 환산할지는 "데이터 포인트 개수"가 아니라 "라벨에서 추출한 실제 연도 차이"를 쓴다. 분기 모드에서 13개 분기 데이터가 있어도 그게 "13년"이 아니라 "3년"(2023→2026)이라는 걸 정확히 인식해서 계산한다 — 이 부분을 잘못 구현하면 분기 개수를 그대로 연 복리 지수로 써서 CAGR이 크게 부풀려지는 실제 버그가 났었다(합성 데이터로 재현 후 수정 확인: 13개 분기를 그대로 쓰면 안 되고 3개년으로 환산해야 정확한 31.4%가 나옴).
-- 두 스크립트 모두 기본 동작(`--outdir` 미지정)은 원본 파일에 시트를 추가해 같은 파일로 덮어쓴다 — 연간과 동일.
+`dart-financial-extractor`의 분기 연환산 기능(`연환산_재무제표`, `지표_연환산`, `투자분석_분기추정`)이 전체 제거되면서, 이 스킬의 `--period quarterly` 옵션도 함께 제거했다. `build_thesis_sheet.py`/`build_valuation_sheet.py`는 다시 연간 워크북(`지표_연간`/`투자분석`) 전용이다.
 
 ### v1.4.0 변경 사항
 
