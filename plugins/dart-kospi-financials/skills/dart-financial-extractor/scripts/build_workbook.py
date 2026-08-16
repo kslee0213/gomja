@@ -319,6 +319,17 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
     return account_row_map, account_name_map, period_labels
 
 
+def _latest_business_day() -> str:
+    """오늘 날짜 기준 가장 최근 평일(월~금)을 YYYYMMDD로 반환한다.
+    주말이면 직전 금요일로 당긴다(공휴일은 고려하지 않는다 — 그 경우
+    KRX 가격 캐시가 없어서 load_price가 자연스럽게 빈 값을 반환하고,
+    build_investment_analysis_sheet가 이를 '데이터 없음' 노트로 안내한다)."""
+    d = dt.date.today()
+    while d.weekday() >= 5:  # 5=토, 6=일
+        d -= dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 def _latest_reprt_code(reports: dict, year: str) -> str | None:
     """해당 연도에 공시된 보고서 중 가장 최신(사업>3분기>반기>1분기) 코드를 반환한다."""
     year_reports = reports.get(year, {})
@@ -2153,12 +2164,15 @@ def main() -> None:
             progress_keys = ["매출액", "영업이익", "당기순이익", "자산총계", "자본총계", "부채총계", "유동자산", "유동부채"]
             keys_hits = {k: resolve_metric(k, y_row_map, y_name_map) for k in progress_keys}
             ann_series = compute_estimated_year_series(reports, estimated_year, keys_hits)
-            _q_end = {"11013": "0331", "11012": "0630", "11014": "0930"}
-            est_date = f"{estimated_year['year']}{_q_end.get(estimated_year['latest_code'], '1231')}"
+            # 추정 연도(E)는 아직 그 연도가 끝나지 않았으므로, 분기말 같은 과거
+            # 기준일이 아니라 "분석 요청 시점(오늘) 기준 가장 최근 영업일" 종가를
+            # 쓴다 — 오늘이 주말이면 직전 금요일로 당긴다(사용자 확정 사양).
+            est_date = _latest_business_day()
             ia_period_dates = [f"{y}1231" for y in year_list] + [est_date]
             ia_banner = (
                 f"※ {estimated_year['year']}(E)는 {REPRT_NAMES.get(estimated_year['latest_code'], '')} 기준 "
-                f"전년 동기 대비 증감율로 추정한 값입니다. 사업보고서가 아니므로 실제와 다를 수 있습니다."
+                f"전년 동기 대비 증감율로 추정한 값입니다. 사업보고서가 아니므로 실제와 다를 수 있습니다. "
+                f"주가는 분석 요청 시점 기준 최근 영업일({est_date}) 종가를 썼습니다."
             )
         ia_warnings = build_investment_analysis_sheet(
             wb, args.company_name, args.corp_code, y_labels, ia_year_list,
