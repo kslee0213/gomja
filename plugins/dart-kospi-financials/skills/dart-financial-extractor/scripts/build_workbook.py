@@ -35,6 +35,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR.parent / "cache"
 
 SJ_ORDER = [("BS", "재무상태표"), ("IS", "손익계산서"), ("CIS", "포괄손익계산서"), ("CF", "현금흐름표")]
+REPRT_NAMES = {"11013": "1분기보고서", "11012": "반기보고서", "11014": "3분기보고서", "11011": "사업보고서"}
 FLOW_TYPES = {"IS", "CIS", "CF"}  # 누적/차감 로직이 필요한 유형
 FONT_NAME = "Arial"
 
@@ -146,7 +147,10 @@ def amount_lookup(data: dict, sj_div: str, account_id: str, field: str = "thstrm
 UNIT_DIVISOR = 100_000_000  # 원 -> 억원
 
 
-def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str], reports: dict, sheet_name: str = "원본데이터"):
+def write_raw_sheet(
+    wb: Workbook, quarter_plan: list[dict], year_list: list[str], reports: dict,
+    sheet_name: str = "원본데이터", extra_periods: list[tuple[dict, str]] | None = None,
+):
     """모든 원자료를 원본 시트에 적재하고, 셀 좌표 인덱스를 반환한다.
     금액은 억원 단위(원 값 / 100,000,000)로 저장한다 — 이 시트가 모든 하위
     시트·수식의 유일한 소스이므로, 여기서 한 번만 나누면 분기/연간 재무제표,
@@ -195,6 +199,10 @@ def write_raw_sheet(wb: Workbook, quarter_plan: list[dict], year_list: list[str]
     for year in year_list:
         fy_data = reports.get(year, {}).get("11011")
         dump_period(fy_data, f"{year}_사업보고서")
+
+    # 추정 연도용 추가 원자료(당해 최신 누적실적, 전년 동기 누적실적 등)
+    for data, label in (extra_periods or []):
+        dump_period(data, label)
 
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 30
@@ -311,31 +319,67 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
     return account_row_map, account_name_map, period_labels
 
 
-def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_index: dict, sheet_name: str = "연간_재무제표", hidden: bool = False):
+def _latest_reprt_code(reports: dict, year: str) -> str | None:
+    """해당 연도에 공시된 보고서 중 가장 최신(사업>3분기>반기>1분기) 코드를 반환한다."""
+    year_reports = reports.get(year, {})
+    for code in ("11011", "11014", "11012", "11013"):
+        if code in year_reports:
+            return code
+    return None
+
+
+def build_annual_sheet(
+    wb: Workbook, year_list: list[str], reports: dict, cell_index: dict,
+    sheet_name: str = "연간_재무제표", hidden: bool = False,
+    estimated_year: dict | None = None,
+):
+    """estimated_year가 주어지면 마지막에 "{year}(E)" 컬럼을 하나 더 추가한다.
+    estimated_year = {
+        "year": "2026", "prior_year": "2025",
+        "cur_label": "2026_추정기준",  # 원본데이터에서 당해 누적실적을 찾을 라벨
+        "prior_label": "2025_추정기준",  # 원본데이터에서 전년 동기 누적실적을 찾을 라벨
+        "field": "thstrm_amount" | "thstrm_add_amount",  # flow 계정 비율 계산에 쓸 필드
+        "bs_label": "2026_추정기준",  # BS 잔액은 이 라벨의 thstrm_amount를 그대로 사용
+    }
+    계산 규칙(사용자 확정): flow 계정 = 전년 사업보고서 실적 × (당해 누적실적 ÷ 전년 동기 누적실적).
+    BS(잔액) 계정 = 당해 최신 분기말 잔액을 그대로(비율 계산 대상 아님)."""
     ws = wb.create_sheet(sheet_name)
     if hidden:
         ws.sheet_state = "hidden"
     ws["A1"] = "단위: 억원 | 사업보고서(연결/별도) 기준, 원본데이터 시트 링크"
     ws["A1"].font = Font(name=FONT_NAME, italic=True, size=9)
+    if estimated_year:
+        ws["A2"] = (
+            f"※ {estimated_year['year']}(E)는 사업보고서가 아직 없어 추정한 값입니다: "
+            f"{estimated_year['prior_year']}년 실적 × ({estimated_year['year']}년 최신 누적실적 ÷ "
+            f"{estimated_year['prior_year']}년 동기간 누적실적). 재무상태표 잔액은 최신 분기말 값을 그대로 썼습니다."
+        )
+        ws["A2"].font = Font(name=FONT_NAME, italic=True, size=9, color="C00000")
+
+    all_labels = [f"{y}" for y in year_list] + ([f"{estimated_year['year']}(E)"] if estimated_year else [])
+    n_cols = len(year_list) + (1 if estimated_year else 0)
 
     header_row = 3
     ws.cell(row=header_row, column=1, value="구분")
     ws.cell(row=header_row, column=2, value="계정과목")
-    for i, year in enumerate(year_list):
-        ws.cell(row=header_row, column=3 + i, value=f"{year}")
-    style_header(ws, header_row, 2 + len(year_list))
+    for i, lab in enumerate(all_labels):
+        ws.cell(row=header_row, column=3 + i, value=lab)
+    style_header(ws, header_row, 2 + n_cols)
 
     account_row_map: dict[tuple[str, str], int] = {}
     account_name_map: dict[tuple[str, str], str] = {}
 
     row = header_row + 1
     fy_periods = [{"fy": reports.get(y, {}).get("11011")} for y in year_list]
+    if estimated_year:
+        fy_periods.append({"fy": reports.get(estimated_year["year"], {}).get(_latest_reprt_code(reports, estimated_year["year"]))})
     for sj_div, sj_name in SJ_ORDER:
         accounts = collect_accounts(fy_periods, sj_div, lambda p: p.get("fy"))
         if not accounts:
             continue
         ws.cell(row=row, column=1, value=sj_name).font = BOLD
         row += 1
+        is_bs = (sj_div == "BS")
         for acc in accounts:
             account_row_map[(sj_div, acc["account_id"])] = row
             account_name_map[(sj_div, acc["account_id"])] = acc["account_nm"]
@@ -348,18 +392,33 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
                     cell.value = f"={ref}"
                     cell.font = GREEN
                 cell.number_format = "#,##0.0;(#,##0.0);-"
+            if estimated_year:
+                col = 3 + len(year_list)
+                cell = ws.cell(row=row, column=col)
+                if is_bs:
+                    ref = _cell_ref_with_alias(cell_index, sj_div, acc, estimated_year["bs_label"], "thstrm_amount")
+                    if ref:
+                        cell.value = f"={ref}"
+                        cell.font = BLUE
+                else:
+                    prior_fy_ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{estimated_year['prior_year']}_사업보고서", "thstrm_amount")
+                    cur_ref = _cell_ref_with_alias(cell_index, sj_div, acc, estimated_year["cur_label"], estimated_year["field"])
+                    prior_ref = _cell_ref_with_alias(cell_index, sj_div, acc, estimated_year["prior_label"], estimated_year["field"])
+                    if prior_fy_ref and cur_ref and prior_ref:
+                        cell.value = f"=IFERROR({prior_fy_ref}*({cur_ref}/{prior_ref}),\"\")"
+                        cell.font = BLUE
+                cell.number_format = "#,##0.0;(#,##0.0);-"
             row += 1
         row += 1
 
     ws.column_dimensions["A"].width = 16
     ws.column_dimensions["B"].width = 32
-    for i in range(len(year_list)):
+    for i in range(n_cols):
         ws.column_dimensions[get_column_letter(3 + i)].width = 18
     ws.freeze_panes = "C4"
-    apply_grid_border(ws, header_row, row - 1, 1, 2 + len(year_list))
+    apply_grid_border(ws, header_row, row - 1, 1, 2 + n_cols)
 
-    period_labels = [f"{year}" for year in year_list]
-    return account_row_map, account_name_map, period_labels
+    return account_row_map, account_name_map, all_labels
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1054,36 @@ def _fmt_num(v):
 
 
 # (v0.13.0: 분기 연환산 관련 코드 전부 제거 — 사용자 요청으로 원복)
+
+def compute_estimated_year_series(reports: dict, estimated_year: dict, keys_hits: dict) -> dict:
+    """N섹션(투자판단 자동평가)용: 추정 연도의 flow/BS 계정값을 파이썬으로
+    계산한다(연간_재무제표의 수식과 동일한 로직, 값 레벨 재현).
+    반환: {key: {estimated_year: 값(원 단위, series()가 amount_lookup과 동일 스케일로 기대)}}"""
+    result: dict[str, dict[str, float]] = {}
+    year = estimated_year["year"]
+    prior_year = estimated_year["prior_year"]
+    field = estimated_year["field"]
+    latest_code = estimated_year["latest_code"]
+    cur_data = reports.get(year, {}).get(latest_code)
+    prior_data = reports.get(prior_year, {}).get(latest_code)
+    prior_fy = reports.get(prior_year, {}).get("11011")
+
+    for key, hit in keys_hits.items():
+        if hit is None:
+            continue
+        sj, aid = hit
+        if sj == "BS":
+            v = amount_lookup(cur_data, sj, aid, "thstrm_amount")
+            if v is not None:
+                result[key] = {year: v}
+            continue
+        cur_v = amount_lookup(cur_data, sj, aid, field)
+        prior_v = amount_lookup(prior_data, sj, aid, field)
+        prior_fy_v = amount_lookup(prior_fy, sj, aid, "thstrm_amount")
+        if cur_v is not None and prior_v not in (None, 0) and prior_fy_v is not None:
+            result[key] = {year: prior_fy_v * (cur_v / prior_v)}
+    return result
+
 
 def build_investment_analysis_sheet(
     wb: Workbook,
@@ -1982,6 +2071,35 @@ def main() -> None:
     year_list = sorted([y for y in reports if "11011" in reports[y]], reverse=True)[: args.years] if want_annual else []
     year_list.sort()  # 오래된 -> 최근
 
+    # 최신 완결연도 다음 해가 아직 사업보고서는 없지만 분기/반기보고서는 있으면,
+    # 그 해를 "추정 연도"로 다룬다(사용자 확정 사양 — v0.15.0).
+    estimated_year: dict | None = None
+    estimated_extra_periods: list[tuple[dict, str]] = []
+    if want_annual and year_list:
+        candidate_year = str(int(year_list[-1]) + 1)
+        latest_code = _latest_reprt_code(reports, candidate_year)
+        if latest_code and latest_code != "11011":
+            field = "thstrm_add_amount" if latest_code == "11014" else "thstrm_amount"
+            cur_data = reports[candidate_year][latest_code]
+            prior_year = year_list[-1]
+            prior_data = reports.get(prior_year, {}).get(latest_code)
+            if prior_data:  # 전년 동기 비교 대상이 있어야 비율 계산이 가능하다
+                cur_label = f"{candidate_year}_추정기준"
+                prior_label = f"{prior_year}_추정기준"
+                estimated_extra_periods = [(cur_data, cur_label), (prior_data, prior_label)]
+                estimated_year = {
+                    "year": candidate_year, "prior_year": prior_year,
+                    "cur_label": cur_label, "prior_label": prior_label,
+                    "bs_label": cur_label, "field": field,
+                    "latest_code": latest_code,
+                }
+            else:
+                print(
+                    f"WARNING: {candidate_year}년 {REPRT_NAMES.get(latest_code, latest_code)}는 있지만 "
+                    f"{prior_year}년 동기간 비교 데이터가 없어 {candidate_year}(E) 추정을 건너뜁니다.",
+                    file=sys.stderr,
+                )
+
     if want_quarterly and len(quarter_plan) < args.quarters:
         print(
             f"WARNING: 요청한 {args.quarters}분기 중 {len(quarter_plan)}분기만 채웠습니다 "
@@ -1997,7 +2115,7 @@ def main() -> None:
     wb = Workbook()
     wb.remove(wb.active)
 
-    cell_index = write_raw_sheet(wb, quarter_plan, year_list, reports)
+    cell_index = write_raw_sheet(wb, quarter_plan, year_list, reports, extra_periods=estimated_extra_periods)
 
     all_missing: dict[str, list[str]] = {}
     if quarter_plan:
@@ -2013,7 +2131,9 @@ def main() -> None:
             all_missing["분기"] = q_missing
 
     if year_list:
-        y_row_map, y_name_map, y_labels = build_annual_sheet(wb, year_list, reports, cell_index)
+        y_row_map, y_name_map, y_labels = build_annual_sheet(
+            wb, year_list, reports, cell_index, estimated_year=estimated_year,
+        )
         y_ind_sheet, y_row_of, y_missing = build_indicator_sheet(
             wb, "연간", "연간_재무제표", y_labels, y_row_map, y_name_map
         )
@@ -2024,9 +2144,26 @@ def main() -> None:
         if y_missing:
             all_missing["연간"] = y_missing
 
+        # 투자분석(N섹션 자동평가 · L섹션 가격조회 기준일)에도 추정 연도를 포함시킨다.
+        ia_year_list = list(year_list) + ([estimated_year["year"]] if estimated_year else [])
+        ann_series = {}
+        ia_period_dates = None
+        ia_banner = None
+        if estimated_year:
+            progress_keys = ["매출액", "영업이익", "당기순이익", "자산총계", "자본총계", "부채총계", "유동자산", "유동부채"]
+            keys_hits = {k: resolve_metric(k, y_row_map, y_name_map) for k in progress_keys}
+            ann_series = compute_estimated_year_series(reports, estimated_year, keys_hits)
+            _q_end = {"11013": "0331", "11012": "0630", "11014": "0930"}
+            est_date = f"{estimated_year['year']}{_q_end.get(estimated_year['latest_code'], '1231')}"
+            ia_period_dates = [f"{y}1231" for y in year_list] + [est_date]
+            ia_banner = (
+                f"※ {estimated_year['year']}(E)는 {REPRT_NAMES.get(estimated_year['latest_code'], '')} 기준 "
+                f"전년 동기 대비 증감율로 추정한 값입니다. 사업보고서가 아니므로 실제와 다를 수 있습니다."
+            )
         ia_warnings = build_investment_analysis_sheet(
-            wb, args.company_name, args.corp_code, y_labels, year_list,
+            wb, args.company_name, args.corp_code, y_labels, ia_year_list,
             y_row_map, y_name_map, y_ind_sheet, y_row_of, reports,
+            period_dates=ia_period_dates, annualized_series=ann_series, banner=ia_banner,
         )
         if ia_warnings:
             all_missing["투자분석(계정 매칭 실패)"] = ia_warnings
