@@ -84,20 +84,48 @@ def build_quarter_plan(reports: dict, n_quarters: int) -> list[dict]:
 
 def collect_accounts(periods: list[dict], sj_div: str, period_key_fn) -> list[dict]:
     """여러 기간의 데이터에서 계정과목 유니온을 ord 순으로 만든다.
-    반환: [{account_id, account_nm}] ord 오름차순, 최근 기간 기준 우선."""
-    seen = {}
-    order_hint = {}
+
+    ⚠️ 계정명(account_nm) 기준으로 병합한다(account_id 기준이 아님). DART는
+    같은 개념의 계정(예: "매출채권")에도 보고서/분기마다 다른 XBRL 계정ID를
+    배정하는 경우가 있다. account_id로만 묶으면 같은 계정명이 서로 다른 행으로
+    쪼개져서, 어느 분기는 A행에만 값이 있고 다른 분기는 B행에만 값이 있는
+    식으로 듬성듬성 비게 된다(실제 데이터로 확인된 버그). 계정명으로 병합하고,
+    그 계정명에 해당하는 모든 account_id를 "별칭(alias)"으로 함께 들고 있다가
+    값을 채울 때 순서대로 시도한다.
+
+    반환: [{account_id(대표 id), account_nm, alias_ids:[그 이름으로 나온 모든 id]}]
+    ord 오름차순, 최근 기간 기준 우선."""
+    seen: dict[str, dict] = {}
+    order_hint: dict[str, int] = {}
     for p in reversed(periods):  # 최근 기간을 우선 기준으로
         data = period_key_fn(p)
         if not data:
             continue
         for item in data.get("items", {}).get(sj_div, []):
             aid = item["account_id"]
-            if aid not in seen:
-                seen[aid] = item["account_nm"]
-                order_hint[aid] = int(item.get("ord") or 9999)
-    ordered = sorted(seen.keys(), key=lambda a: order_hint[a])
-    return [{"account_id": a, "account_nm": seen[a]} for a in ordered]
+            nm = item["account_nm"]
+            ordv = int(item.get("ord") or 9999)
+            if nm not in seen:
+                seen[nm] = {"id": aid, "alias_ids": {aid}}
+                order_hint[nm] = ordv
+            else:
+                seen[nm]["alias_ids"].add(aid)
+    ordered = sorted(seen.keys(), key=lambda nm: order_hint[nm])
+    return [
+        {"account_id": seen[nm]["id"], "account_nm": nm, "alias_ids": sorted(seen[nm]["alias_ids"])}
+        for nm in ordered
+    ]
+
+
+def _cell_ref_with_alias(cell_index: dict, sj_div: str, acc: dict, period_label: str, field: str = "thstrm_amount"):
+    """acc(collect_accounts가 반환한 항목)의 대표 account_id로 먼저 찾고,
+    없으면 같은 계정명으로 묶인 다른 alias_ids도 순서대로 시도한다."""
+    ids = [acc["account_id"]] + [a for a in acc.get("alias_ids", []) if a != acc["account_id"]]
+    for aid in ids:
+        ref = cell_index.get((sj_div, aid, period_label, field))
+        if ref:
+            return ref
+    return None
 
 
 def amount_lookup(data: dict, sj_div: str, account_id: str, field: str = "thstrm_amount"):
@@ -231,30 +259,30 @@ def build_quarterly_sheet(wb: Workbook, quarter_plan: list[dict], cell_index: di
                 if sj_div == "BS":
                     # 시점 데이터: 해당 분기말 보고서를 그대로 링크
                     src_key = "fy" if q == 4 else "q3" if q == 3 else "h1" if q == 2 else "q1"
-                    ref = cell_index.get((sj_div, acc["account_id"], f"{label}{src_key}", "thstrm_amount"))
+                    ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}{src_key}", "thstrm_amount")
                     if ref:
                         cell.value = f"={ref}"
                         cell.font = GREEN
                 elif q == 1:
-                    ref = cell_index.get((sj_div, acc["account_id"], f"{label}q1", "thstrm_amount"))
+                    ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}q1", "thstrm_amount")
                     if ref:
                         cell.value = f"={ref}"
                         cell.font = GREEN
                 elif q == 3:
-                    ref = cell_index.get((sj_div, acc["account_id"], f"{label}q3", "thstrm_amount"))
+                    ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}q3", "thstrm_amount")
                     if ref:
                         cell.value = f"={ref}"
                         cell.font = GREEN
                 elif q == 2:
-                    h1_ref = cell_index.get((sj_div, acc["account_id"], f"{label}h1", "thstrm_amount"))
-                    q1_ref = cell_index.get((sj_div, acc["account_id"], f"{label}q1", "thstrm_amount"))
+                    h1_ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}h1", "thstrm_amount")
+                    q1_ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}q1", "thstrm_amount")
                     if h1_ref and q1_ref:
                         cell.value = f"={h1_ref}-{q1_ref}"
                         cell.font = BLACK
                 elif q == 4:
-                    fy_ref = cell_index.get((sj_div, acc["account_id"], f"{label}fy", "thstrm_amount"))
+                    fy_ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}fy", "thstrm_amount")
                     # 4분기는 원칙적으로 3분기보고서의 '누적' 필드(thstrm_add_amount)를 쓴다.
-                    q3_add_ref = cell_index.get((sj_div, acc["account_id"], f"{label}q3", "thstrm_add_amount"))
+                    q3_add_ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{label}q3", "thstrm_add_amount")
                     if fy_ref and q3_add_ref:
                         cell.value = f"={fy_ref}-{q3_add_ref}"
                         cell.font = BLACK
@@ -315,7 +343,7 @@ def build_annual_sheet(wb: Workbook, year_list: list[str], reports: dict, cell_i
             for i, year in enumerate(year_list):
                 col = 3 + i
                 cell = ws.cell(row=row, column=col)
-                ref = cell_index.get((sj_div, acc["account_id"], f"{year}_사업보고서", "thstrm_amount"))
+                ref = _cell_ref_with_alias(cell_index, sj_div, acc, f"{year}_사업보고서", "thstrm_amount")
                 if ref:
                     cell.value = f"={ref}"
                     cell.font = GREEN
@@ -368,7 +396,11 @@ METRIC_RULES: dict[str, tuple[str, list[str], list[str], list[str]]] = {
     "이익잉여금": ("BS", ["이익잉여금", "이익잉여금(결손금)"], ["이익잉여금"], []),
     "현금및현금성자산의증가": (
         "CF",
-        ["현금및현금성자산의순증가(감소)", "현금및현금성자산의 증가(감소)", "현금및현금성자산의증가(감소)"],
+        [
+            "현금및현금성자산의순증가(감소)", "현금및현금성자산의 증가(감소)", "현금및현금성자산의증가(감소)",
+            "현금및현금성자산의 증가", "현금및현금성자산의증가", "현금및현금성자산의 증감", "현금및현금성자산의증감",
+            "현금및현금성자산의 순증가", "현금및현금성자산의순증가",
+        ],
         ["현금및현금성자산의"],
         ["기초", "기말", "환율"],
     ),
