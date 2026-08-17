@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""build_workbook.py — 미국 상장기업 재무 워크북 생성.
+"""build_workbook.py — 미국 상장기업 재무 워크북 생성 (SEC EDGAR 기반).
 
-v2.0.0 재작성: dart-kospi-financials의 검증된 설계를 기준으로 삼았다.
-v1.0.0 대비 달라진 것(실제로 고친 문제):
-  - build_workbook이 fetch_financials.py가 만든 캐시를 실제로 읽는다
-    (v1.0.0은 캐시를 무시하고 매번 yfinance를 새로 호출했다).
-  - 모든 셀이 "원본데이터" 시트를 참조하는 수식으로 만들어진다(감사 가능).
-    v1.0.0은 계산된 숫자를 그대로 셀에 박아넣었다.
-  - 계정 매칭에 yfinance의 실제 키 이름(Stockholders Equity 등)을 쓴다.
-    v1.0.0은 존재하지 않는 키('Total Equity' 등)를 써서 지표가 전부 비었다.
-  - `%Y-Q%q`(존재하지 않는 strftime 코드) 버그를 제거했다.
-  - "지표_분기/지표_연간"(차트 포함)과 투자분석 시트가 실제로 만들어진다
-    (v1.0.0은 문서에만 있고 코드에는 없었다).
-  - yfinance가 실제 제공하는 개수(보통 분기 4~5개, 연간 4개)만큼만 채우고,
-    "12개 분기"를 항상 다 채울 수 있다고 가정하지 않는다.
+v3.0.0: 데이터 소스를 yfinance(비공식, Yahoo 403 차단 위험)에서 SEC EDGAR
+공식 API(무료, 키불필요, 차단 위험 낮음)로 전환했다. 주가만 yfinance를
+최소한으로 쓴다(fetch_extra_info.py). 감사 가능성 원칙(원본데이터 시트 +
+수식 참조)은 v2.0.0과 동일하게 유지한다.
 """
 import argparse
 import datetime as dt
@@ -28,55 +19,19 @@ from openpyxl.utils import get_column_letter
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR.parent / "cache"
+sys.path.insert(0, str(SCRIPT_DIR))
+from fetch_financials import ACCOUNTS, INSTANT_KEYS, build_frequency_payload, load_companyfacts_cache  # noqa: E402
 
 FONT_NAME = "맑은 고딕"
 TITLE_FONT = Font(name=FONT_NAME, bold=True, size=14)
 BOLD = Font(name=FONT_NAME, bold=True)
-GREEN = Font(name=FONT_NAME, color="006100")  # 원본 그대로 참조된 실측값
-BLUE = Font(name=FONT_NAME, color="0000FF")   # 계산/추정값
+GREEN = Font(name=FONT_NAME, color="006100")
+BLUE = Font(name=FONT_NAME, color="0000FF")
 NOTE = Font(name=FONT_NAME, italic=True, size=9, color="808080")
 HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")
 THIN = Side(style="thin", color="000000")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-UNIT_DIVISOR = 1_000_000  # 표시 단위: 백만달러(USD Millions)
-
-# ---------------------------------------------------------------------------
-# 계정 매핑: yfinance의 실제 DataFrame 인덱스 이름을 기준으로 한다.
-# (키, 정확일치 후보 목록[우선순위 순], 표시 라벨) — 여러 후보를 두는 이유는
-# yfinance가 버전/기업에 따라 동의어를 쓰는 경우가 있기 때문이다(예: "Cost Of
-# Revenue" vs "Reconciled Cost Of Revenue"). 후보 전부 실패하면 그 계정은
-# 빈 채로 남기고 지어내지 않는다.
-# ---------------------------------------------------------------------------
-ACCOUNTS = {
-    # key: (sj, [후보들], 라벨)
-    "매출액": ("income_statement", ["Total Revenue", "Operating Revenue"], "매출액"),
-    "매출원가": ("income_statement", ["Cost Of Revenue", "Reconciled Cost Of Revenue"], "매출원가"),
-    "매출총이익": ("income_statement", ["Gross Profit"], "매출총이익"),
-    "영업이익": ("income_statement", ["Operating Income"], "영업이익"),
-    "EBITDA": ("income_statement", ["EBITDA", "Normalized EBITDA"], "EBITDA"),
-    "세전이익": ("income_statement", ["Pretax Income"], "세전이익"),
-    "법인세비용": ("income_statement", ["Tax Provision"], "법인세비용"),
-    "당기순이익": ("income_statement", ["Net Income", "Net Income Common Stockholders"], "당기순이익"),
-    "이자비용": ("income_statement", ["Interest Expense"], "이자비용"),
-    "EPS(희석)": ("income_statement", ["Diluted EPS"], "EPS(희석)"),
-
-    "유동자산": ("balance_sheet", ["Current Assets"], "유동자산"),
-    "자산총계": ("balance_sheet", ["Total Assets"], "자산총계"),
-    "유동부채": ("balance_sheet", ["Current Liabilities"], "유동부채"),
-    "부채총계": ("balance_sheet", ["Total Liabilities Net Minority Interest"], "부채총계"),
-    "자본총계": ("balance_sheet", ["Stockholders Equity"], "자본총계"),
-    "현금및현금성자산": ("balance_sheet", ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"], "현금및현금성자산"),
-    "재고자산": ("balance_sheet", ["Inventory"], "재고자산"),
-    "매출채권": ("balance_sheet", ["Accounts Receivable", "Receivables"], "매출채권"),
-    "총차입금": ("balance_sheet", ["Total Debt"], "총차입금"),
-    "유형자산": ("balance_sheet", ["Net PPE", "Gross PPE"], "유형자산(PP&E)"),
-
-    "영업활동현금흐름": ("cash_flow", ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], "영업활동현금흐름"),
-    "잉여현금흐름": ("cash_flow", ["Free Cash Flow"], "잉여현금흐름(FCF)"),
-    "설비투자": ("cash_flow", ["Capital Expenditure"], "설비투자(CapEx)"),
-    "감가상각비": ("cash_flow", ["Depreciation And Amortization", "Depreciation Amortization Depletion"], "감가상각비(D&A)"),
-    "배당금지급": ("cash_flow", ["Cash Dividends Paid", "Common Stock Dividend Paid"], "배당금지급"),
-}
+UNIT_DIVISOR = 1_000_000  # 표시 단위: 백만달러
 
 SJ_ORDER = [
     ("income_statement", "손익계산서"),
@@ -85,44 +40,11 @@ SJ_ORDER = [
 ]
 
 
-def load_financials_cache(ticker: str, frequency: str) -> dict | None:
-    fp = CACHE_DIR / f"financials_{ticker}_{frequency}.json"
+def load_price_cache(ticker: str) -> dict | None:
+    fp = CACHE_DIR / f"price_{ticker.upper()}.json"
     if not fp.exists():
         return None
     return json.loads(fp.read_text(encoding="utf-8"))
-
-
-def load_extra_info_cache(ticker: str) -> dict | None:
-    fp = CACHE_DIR / f"extra_info_{ticker}.json"
-    if not fp.exists():
-        return None
-    return json.loads(fp.read_text(encoding="utf-8"))
-
-
-def load_company_cache(ticker: str) -> dict | None:
-    fp = CACHE_DIR / f"company_{ticker}.json"
-    if not fp.exists():
-        return None
-    return json.loads(fp.read_text(encoding="utf-8"))
-
-
-def _sorted_periods(freq_data: dict, n: int) -> list[str]:
-    """freq_data(income_statement/balance_sheet/cash_flow를 담은 dict)에서
-    실제 존재하는 기간(날짜문자열) 목록을 오래된순으로 정렬해 최근 n개를 반환."""
-    dates: set[str] = set()
-    for sj in ("income_statement", "balance_sheet", "cash_flow"):
-        for account_data in freq_data.get(sj, {}).values():
-            dates.update(account_data.keys())
-    sorted_dates = sorted(dates)  # "YYYY-MM-DD" 문자열이라 사전순=시간순
-    return sorted_dates[-n:] if n else sorted_dates
-
-
-def _resolve_value(freq_data: dict, sj: str, candidates: list[str], period: str):
-    for cand in candidates:
-        row = freq_data.get(sj, {}).get(cand)
-        if row and period in row and row[period] is not None:
-            return row[period], cand
-    return None, None
 
 
 def style_header(ws, row: int, min_col: int, max_col: int) -> None:
@@ -139,33 +61,31 @@ def apply_border(ws, r1: int, r2: int, c1: int, c2: int) -> None:
             ws.cell(row=r, column=c).border = BORDER
 
 
-def write_raw_sheet(wb: Workbook, ticker: str, q_data: dict | None, a_data: dict | None,
+def write_raw_sheet(wb: Workbook, ticker: str, q_payload: dict | None, a_payload: dict | None,
                      q_periods: list[str], a_periods: list[str]) -> dict:
-    """원본데이터 시트: 캐시에서 읽은 raw 값을 그대로 기록한다(달러 단위,
-    환산 없음). 다른 시트는 전부 이 시트를 수식으로 참조해 감사 가능하게 만든다.
-    반환: cell_index = {(freq, key, period): "'원본데이터'!$C$5" 형태 참조 문자열}"""
+    """원본데이터 시트: SEC CompanyFacts에서 뽑은 값을 그대로 기록한다(달러,
+    무환산). 다른 시트는 전부 이 시트를 수식으로 참조한다."""
     ws = wb.create_sheet("원본데이터")
     ws.sheet_state = "hidden"
-    ws["A1"] = f"{ticker} — yfinance 원자료(달러, 무환산)"
+    ws["A1"] = f"{ticker} — SEC EDGAR XBRL 원자료(달러, 무환산)"
     ws["A1"].font = NOTE
 
     cell_index: dict[tuple[str, str, str], str] = {}
     row = 3
-
-    for freq, data, periods in (("quarterly", q_data, q_periods), ("annual", a_data, a_periods)):
-        if not data or not periods:
+    for freq, payload, periods in (("quarterly", q_payload, q_periods), ("annual", a_payload, a_periods)):
+        if not payload or not periods:
             continue
         ws.cell(row=row, column=1, value=f"[{freq}]").font = BOLD
         row += 1
-        header_row = row
         ws.cell(row=row, column=1, value="계정")
         for i, p in enumerate(periods):
             ws.cell(row=row, column=2 + i, value=p)
         row += 1
-        for key, (sj, candidates, label) in ACCOUNTS.items():
+        for key, (sj, _cand, _label) in ACCOUNTS.items():
             ws.cell(row=row, column=1, value=f"{key} ({sj})")
+            series = payload.get(sj, {}).get(key, {})
             for i, p in enumerate(periods):
-                val, matched = _resolve_value(data, sj, candidates, p)
+                val = series.get(p)
                 col = 2 + i
                 if val is not None:
                     ws.cell(row=row, column=col, value=val)
@@ -178,20 +98,20 @@ def write_raw_sheet(wb: Workbook, ticker: str, q_data: dict | None, a_data: dict
     return cell_index
 
 
-def build_statement_sheet(wb: Workbook, sheet_name: str, freq: str, periods: list[str],
-                           cell_index: dict, hidden: bool = False):
-    """분기_재무제표/연간_재무제표: 원본데이터를 참조하는 수식으로, 백만달러
-    단위로 환산해서 보여준다. 반환: (account_row_map, period_labels)"""
+PER_SHARE_KEYS = {"EPS(희석)"}  # 주당 지표는 백만달러 단위 환산 대상이 아니다(달러 그대로)
+
+
+def build_statement_sheet(wb: Workbook, sheet_name: str, freq: str, periods: list[str], cell_index: dict, hidden: bool = False):
     ws = wb.create_sheet(sheet_name)
     if hidden:
         ws.sheet_state = "hidden"
-    ws["A1"] = "단위: 백만달러(USD Millions) | yfinance(Yahoo Finance) 기준, 원본데이터 시트 링크"
+    ws["A1"] = "단위: 백만달러(USD Millions) | SEC EDGAR XBRL 기준, 원본데이터 시트 링크"
     ws["A1"].font = NOTE
 
     header_row = 3
     ws.cell(row=header_row, column=1, value="구분")
     ws.cell(row=header_row, column=2, value="계정과목")
-    labels = [p[:7] for p in periods]  # "YYYY-MM" 형태로 간결하게
+    labels = [p[:7] for p in periods]
     for i, lab in enumerate(labels):
         ws.cell(row=header_row, column=3 + i, value=lab)
     style_header(ws, header_row, 1, 2 + len(periods))
@@ -210,9 +130,15 @@ def build_statement_sheet(wb: Workbook, sheet_name: str, freq: str, periods: lis
                 ref = cell_index.get((freq, key, p))
                 cell = ws.cell(row=row, column=3 + i)
                 if ref:
-                    cell.value = f"=({ref})/{UNIT_DIVISOR}"
+                    if key in PER_SHARE_KEYS:
+                        cell.value = f"=({ref})"
+                        cell.number_format = "#,##0.00"
+                    else:
+                        cell.value = f"=({ref})/{UNIT_DIVISOR}"
+                        cell.number_format = "#,##0.0;(#,##0.0);-"
                     cell.font = GREEN
-                cell.number_format = "#,##0.0;(#,##0.0);-"
+                else:
+                    cell.number_format = "#,##0.0;(#,##0.0);-"
             row += 1
         row += 1
 
@@ -226,7 +152,6 @@ def build_statement_sheet(wb: Workbook, sheet_name: str, freq: str, periods: lis
 
 
 INDICATOR_ROWS = [
-    # (라벨, 분자키, 분모키, 배수, 서식) — 분모가 0/None이면 빈 칸.
     ("매출액", "매출액", None, 1, "#,##0.0"),
     ("영업이익", "영업이익", None, 1, "#,##0.0"),
     ("당기순이익", "당기순이익", None, 1, "#,##0.0"),
@@ -241,15 +166,13 @@ INDICATOR_ROWS = [
 ]
 
 
-def build_indicator_sheet(wb: Workbook, sheet_name: str, stmt_sheet: str,
-                           account_row_map: dict, period_labels: list[str]):
-    """지표_분기/지표_연간: 재무제표 시트를 참조하는 비율 수식."""
+def build_indicator_sheet(wb: Workbook, sheet_name: str, stmt_sheet: str, account_row_map: dict, period_labels: list[str]):
     ws = wb.create_sheet(sheet_name)
     n = len(period_labels)
     ws.cell(row=1, column=1, value="지표")
     for i, lab in enumerate(period_labels):
         ws.cell(row=1, column=3 + i, value=lab)
-    style_header(ws, 1, 2, 2 + n)
+    style_header(ws, 1, 1, 2 + n)
 
     row_of: dict[str, int] = {}
     row = 2
@@ -259,9 +182,8 @@ def build_indicator_sheet(wb: Workbook, sheet_name: str, stmt_sheet: str,
         num_row = account_row_map.get(num_key)
         den_row = account_row_map.get(den_key) if den_key else None
         for i in range(n):
-            col = 3 + i
-            col_letter = get_column_letter(col)
-            cell = ws.cell(row=row, column=col)
+            col_letter = get_column_letter(3 + i)
+            cell = ws.cell(row=row, column=3 + i)
             if num_row and (den_key is None or den_row):
                 num_ref = f"'{stmt_sheet}'!{col_letter}{num_row}"
                 if den_key is None:
@@ -277,14 +199,13 @@ def build_indicator_sheet(wb: Workbook, sheet_name: str, stmt_sheet: str,
 
 
 def embed_charts(wb: Workbook, ws_ind, row_of: dict, n_periods: int, sheet_label: str):
-    """지표 시트 표 옆(표 마지막 열+2칸)에 라인 차트를 임베드한다."""
     chart_specs = [
         ("매출액·영업이익·순이익 추이", ["매출액", "영업이익", "당기순이익"]),
         ("수익성 지표(%) 추이", ["매출총이익률(%)", "영업이익률(%)", "순이익률(%)"]),
         ("ROE·ROA(%) 추이", ["ROE(%)", "ROA(%)"]),
         ("건전성 지표(%) 추이", ["부채비율(%)", "유동비율(%)", "자기자본비율(%)"]),
     ]
-    anchor_col_idx = 2 + n_periods + 2  # 표 마지막 열 + 2칸 여백
+    anchor_col_idx = 2 + n_periods + 2
     anchor_col = get_column_letter(anchor_col_idx)
     anchor_row = 2
     for title, metric_labels in chart_specs:
@@ -309,13 +230,16 @@ def embed_charts(wb: Workbook, ws_ind, row_of: dict, n_periods: int, sheet_label
 
 def build_investment_analysis_sheet(wb: Workbook, ticker: str, company_name: str,
                                      a_row_of: dict, period_labels: list[str],
-                                     extra_info: dict | None):
-    """투자분석 시트: 재무비율(지표_연간 요약) + 위험신호 + 주가지표 + 간이 투자판단."""
+                                     price_data: dict | None, eps_ref: str | None, bvps_ref: str | None,
+                                     rev_per_share_ref: str | None):
+    """투자분석 시트. PER/PBR/PSR은 yfinance의 완제품 값을 그대로 믿지 않고,
+    (주가) ÷ (SEC 재무제표에서 뽑은 EPS/BVPS/주당매출)로 우리가 직접 수식
+    계산한다 — 감사 가능성 원칙 유지."""
     ws = wb.create_sheet("투자분석")
     n = len(period_labels)
     ws["A1"] = f"투자분석 — {company_name} ({ticker})"
     ws["A1"].font = TITLE_FONT
-    ws["A3"] = "단위: 백만달러(USD Millions) | yfinance 기준"
+    ws["A3"] = "단위: 백만달러(USD Millions), 주가는 달러 | 재무제표: SEC EDGAR, 주가: yfinance(최소 사용)"
     ws["A3"].font = NOTE
     row = 5
 
@@ -342,7 +266,6 @@ def build_investment_analysis_sheet(wb: Workbook, ticker: str, company_name: str
         apply_border(ws, row, row, 1, 2 + n)
         row += 1
 
-    # --- A. 재무비율 요약 (지표_연간 참조) ---
     section("A. 재무비율 요약")
     ratio_header()
     for label in ["매출총이익률(%)", "영업이익률(%)", "순이익률(%)", "ROE(%)", "ROA(%)",
@@ -350,7 +273,6 @@ def build_investment_analysis_sheet(wb: Workbook, ticker: str, company_name: str
         copy_row(label, a_row_of.get(label))
     row += 1
 
-    # --- B. 위험 신호 점검 ---
     section("B. 위험 신호 점검")
     ratio_header()
     debt_row = a_row_of.get("부채비율(%)")
@@ -359,66 +281,95 @@ def build_investment_analysis_sheet(wb: Workbook, ticker: str, company_name: str
     for i in range(n):
         col_letter = get_column_letter(3 + i)
         if debt_row:
-            ws.cell(row=row, column=3 + i,
-                    value=f"=IF('지표_연간'!{col_letter}{debt_row}>200,\"⚠ 위험\",\"양호\")")
+            ws.cell(row=row, column=3 + i, value=f"=IF('지표_연간'!{col_letter}{debt_row}>200,\"⚠ 위험\",\"양호\")")
     apply_border(ws, row, row, 1, 2 + n)
     row += 1
     ws.cell(row=row, column=1, value="유동비율 100% 미만")
     for i in range(n):
         col_letter = get_column_letter(3 + i)
         if curr_row:
-            ws.cell(row=row, column=3 + i,
-                    value=f"=IF('지표_연간'!{col_letter}{curr_row}<100,\"⚠ 위험\",\"양호\")")
+            ws.cell(row=row, column=3 + i, value=f"=IF('지표_연간'!{col_letter}{curr_row}<100,\"⚠ 위험\",\"양호\")")
     apply_border(ws, row, row, 1, 2 + n)
     row += 2
 
-    # --- C. 주가 연동 지표 (extra_info 캐시 기준, 현재 시점 스냅샷) ---
-    section("C. 주가 연동 지표 (현재 시점, yfinance .info 기준)")
-    info = (extra_info or {}).get("info", {})
-    div = (extra_info or {}).get("dividends", {})
-    price_rows = [
-        ("현재가", info.get("currentPrice") or info.get("regularMarketPrice")),
-        ("시가총액(백만달러)", (info.get("marketCap") / UNIT_DIVISOR) if info.get("marketCap") else None),
-        ("PER(trailing)", info.get("trailingPE")),
-        ("PBR", info.get("priceToBook")),
-        ("PSR", info.get("priceToSalesTrailing12Months")),
-        ("배당수익률(%)", (info.get("dividendYield") * 100) if info.get("dividendYield") else None),
-        ("배당성향(%)", (info.get("payoutRatio") * 100) if info.get("payoutRatio") else None),
-        ("52주 최고", info.get("fiftyTwoWeekHigh")),
-        ("52주 최저", info.get("fiftyTwoWeekLow")),
-    ]
+    # --- C. 주가 연동 지표 (SEC 재무제표 값 + 주가로 직접 계산) ---
+    section("C. 주가 연동 지표 (최신 연도 기준, PER/PBR/PSR은 직접 수식 계산)")
+    info = (price_data or {}).get("price", {})
+    price = info.get("currentPrice")
     missing_price = []
-    for label, val in price_rows:
-        ws.cell(row=row, column=1, value=label)
-        if val is not None:
-            c = ws.cell(row=row, column=3, value=val)
-            c.number_format = "#,##0.00"
-        else:
-            missing_price.append(label)
-        apply_border(ws, row, row, 1, 3)
-        row += 1
+    ws.cell(row=row, column=1, value="현재가($)")
+    if price is not None:
+        ws.cell(row=row, column=3, value=price).number_format = "#,##0.00"
+    else:
+        missing_price.append("현재가")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
+    shares = info.get("sharesOutstanding")
+    mktcap = info.get("marketCap")
+    ws.cell(row=row, column=1, value="시가총액(백만달러)")
+    if mktcap is not None:
+        ws.cell(row=row, column=3, value=mktcap / UNIT_DIVISOR).number_format = "#,##0.0"
+    else:
+        missing_price.append("시가총액")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
+    last_col = get_column_letter(2 + n)
+    per_row = row
+    ws.cell(row=row, column=1, value="PER(배) = 현재가 ÷ EPS")
+    if price is not None and eps_ref:
+        ws.cell(row=row, column=3, value=f"=IFERROR({price}/{eps_ref},\"\")").number_format = "0.00"
+    else:
+        missing_price.append("PER(EPS 없음)")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
+    ws.cell(row=row, column=1, value="PBR(배) = 현재가 ÷ 주당순자산(BVPS)")
+    if price is not None and bvps_ref:
+        ws.cell(row=row, column=3, value=f"=IFERROR({price}/{bvps_ref},\"\")").number_format = "0.00"
+    else:
+        missing_price.append("PBR(BVPS 없음, 상장주식수 필요)")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
+    ws.cell(row=row, column=1, value="PSR(배) = 현재가 ÷ 주당매출")
+    if price is not None and rev_per_share_ref:
+        ws.cell(row=row, column=3, value=f"=IFERROR({price}/{rev_per_share_ref},\"\")").number_format = "0.00"
+    else:
+        missing_price.append("PSR(주당매출 없음)")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
+    div_yield = info.get("dividendYield")
+    ws.cell(row=row, column=1, value="배당수익률(%)")
+    if div_yield is not None:
+        ws.cell(row=row, column=3, value=div_yield * 100).number_format = "0.00"
+    else:
+        missing_price.append("배당수익률")
+    apply_border(ws, row, row, 1, 3)
+    row += 1
+
     if missing_price:
-        ws.cell(row=row, column=1, value=f"※ yfinance에서 못 가져온 항목: {', '.join(missing_price)}").font = Font(name=FONT_NAME, italic=True, size=9, color="C00000")
+        ws.cell(row=row, column=1, value=f"※ 못 가져온 항목(재무제표 SEC EDGAR는 정상, 주가/yfinance 관련만 영향): {', '.join(missing_price)}").font = Font(name=FONT_NAME, italic=True, size=9, color="C00000")
         row += 1
     row += 1
 
-    # --- D. 간이 투자판단 (규칙 기반, 참고용) ---
     section("D. 간이 투자판단 (참고용 — 결정론적 규칙, 투자 조언 아님)")
     ws.cell(row=row, column=1, value="※ 재무비율 3개(부채비율/ROE/유동비율)만 보는 간이 등급이며, 정성적 요인은 반영하지 않습니다.").font = NOTE
     row += 1
     if debt_row and a_row_of.get("ROE(%)") and curr_row:
-        last_col = get_column_letter(2 + n)
-        ws.cell(row=row, column=1, value="종합 등급(최신 기간)")
         formula = (
             f"=IF(AND('지표_연간'!{last_col}{debt_row}<150,'지표_연간'!{last_col}{a_row_of['ROE(%)']}>15,"
             f"'지표_연간'!{last_col}{curr_row}>120),\"A(우수)\","
             f"IF(AND('지표_연간'!{last_col}{debt_row}<200,'지표_연간'!{last_col}{a_row_of['ROE(%)']}>8),\"B(양호)\",\"C(보통 이하 — 직접 확인 필요)\"))"
         )
+        ws.cell(row=row, column=1, value="종합 등급(최신 기간)")
         ws.cell(row=row, column=3, value=formula)
         apply_border(ws, row, row, 1, 3)
     row += 2
 
-    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 4
     for i in range(n):
         ws.column_dimensions[get_column_letter(3 + i)].width = 13
@@ -426,22 +377,26 @@ def build_investment_analysis_sheet(wb: Workbook, ticker: str, company_name: str
 
 
 def build_workbook(ticker: str, company_name: str, period: str, quarters: int, years: int, outdir: str) -> dict:
-    q_data = load_financials_cache(ticker, "quarterly") if period in ("quarterly", "both") else None
-    a_data = load_financials_cache(ticker, "annual") if period in ("annual", "both") else None
-    extra_info = load_extra_info_cache(ticker)
+    cached = load_companyfacts_cache(ticker)
+    if not cached:
+        print(f"WARNING: {ticker} SEC CompanyFacts 캐시가 없습니다. fetch_financials.py를 먼저 실행하세요.", file=sys.stderr)
+        raw_facts = None
+    else:
+        raw_facts = cached["raw"]
 
-    if period in ("quarterly", "both") and not q_data:
-        print(f"WARNING: {ticker} 분기 캐시가 없습니다. fetch_financials.py를 먼저 실행하세요.", file=sys.stderr)
-    if period in ("annual", "both") and not a_data:
-        print(f"WARNING: {ticker} 연간 캐시가 없습니다. fetch_financials.py를 먼저 실행하세요.", file=sys.stderr)
+    q_payload = q_periods = a_payload = a_periods = None
+    if raw_facts:
+        if period in ("quarterly", "both"):
+            q_payload, q_periods = build_frequency_payload(raw_facts, "quarterly", quarters)
+        if period in ("annual", "both"):
+            a_payload, a_periods = build_frequency_payload(raw_facts, "annual", years)
 
-    q_periods = _sorted_periods(q_data, quarters) if q_data else []
-    a_periods = _sorted_periods(a_data, years) if a_data else []
+    price_data = load_price_cache(ticker)
 
     wb = Workbook()
     wb.remove(wb.active)
 
-    cell_index = write_raw_sheet(wb, ticker, q_data, a_data, q_periods, a_periods)
+    cell_index = write_raw_sheet(wb, ticker, q_payload, a_payload, q_periods or [], a_periods or [])
 
     missing_price = []
     if q_periods:
@@ -453,7 +408,26 @@ def build_workbook(ticker: str, company_name: str, period: str, quarters: int, y
         a_row_map, a_labels = build_statement_sheet(wb, "연간_재무제표", "annual", a_periods, cell_index)
         a_ind_row_of = build_indicator_sheet(wb, "지표_연간", "연간_재무제표", a_row_map, a_labels)
         embed_charts(wb, wb["지표_연간"], a_ind_row_of, len(a_labels), "연간")
-        missing_price = build_investment_analysis_sheet(wb, ticker, company_name, a_ind_row_of, a_labels, extra_info)
+
+        # PER/PBR/PSR 계산용 참조: 최신 연도의 EPS, BVPS(자본÷상장주식수), 주당매출(매출÷상장주식수)
+        last_i = len(a_labels) - 1
+        last_col = get_column_letter(3 + last_i)
+        eps_row = a_row_map.get("EPS(희석)")
+        eps_ref = f"'연간_재무제표'!{last_col}{eps_row}" if eps_row else None
+        shares = (price_data or {}).get("price", {}).get("sharesOutstanding")
+        equity_row = a_row_map.get("자본총계")
+        revenue_row = a_row_map.get("매출액")
+        bvps_ref = rev_per_share_ref = None
+        if shares:
+            shares_millions = shares / UNIT_DIVISOR
+            if equity_row:
+                bvps_ref = f"('연간_재무제표'!{last_col}{equity_row}/{shares_millions})"
+            if revenue_row:
+                rev_per_share_ref = f"('연간_재무제표'!{last_col}{revenue_row}/{shares_millions})"
+
+        missing_price = build_investment_analysis_sheet(
+            wb, ticker, company_name, a_ind_row_of, a_labels, price_data, eps_ref, bvps_ref, rev_per_share_ref,
+        )
 
     desired_order = ["분기_재무제표", "연간_재무제표", "지표_분기", "지표_연간", "투자분석", "원본데이터"]
     wb._sheets = [wb[name] for name in desired_order if name in wb.sheetnames]
@@ -470,14 +444,14 @@ def build_workbook(ticker: str, company_name: str, period: str, quarters: int, y
         "saved": str(filepath),
         "ticker": ticker,
         "period": period,
-        "quarters_filled": len(q_periods),
-        "years_filled": len(a_periods),
+        "quarters_filled": len(q_periods or []),
+        "years_filled": len(a_periods or []),
         "missing_price_fields": missing_price,
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="미국 상장기업 재무 엑셀 생성")
+    ap = argparse.ArgumentParser(description="미국 상장기업 재무 엑셀 생성(SEC EDGAR 기반)")
     ap.add_argument("ticker")
     ap.add_argument("company_name")
     ap.add_argument("--period", choices=["quarterly", "annual", "both"], default="both")
