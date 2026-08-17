@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""ticker_lookup.py — 자주 쓰는 기업명(한글/영문)을 Ticker로 변환한다.
+"""ticker_lookup.py — 기업명/Ticker를 SEC CIK(Central Index Key)로 변환한다.
 
-⚠️ v1.0.0은 문서에 "200+ 기업 자동 매핑"이라고 적어놓고 실제 매핑 사전은
-11개뿐이었다(문서-코드 불일치). 이 버전은 매핑 목록을 정직하게 이 파일
-안의 COMMON_TICKERS 개수 그대로로 유지하고, 여기 없는 기업은 무조건
-"Ticker를 직접 입력하세요"로 안내한다 — 억지로 야후 파이낸스 검색 API를
-붙여 "혹시 맞을 수도 있는" 티커를 추측하지 않는다(잘못된 회사 데이터를
-가져오는 것보다 명확히 실패하는 게 낫다).
+v3.0.0: SEC EDGAR로 전환하면서 CIK 확보가 필수가 됐다. SEC가 공식으로 제공하는
+전체 티커→CIK 매핑 파일(company_tickers.json, API 키 불필요)을 한 번 받아
+캐시해두고 재사용한다 — 회사마다 개별 조회할 필요가 없다.
+
+⚠️ SEC 요청 시 User-Agent 헤더에 "앱이름 연락처이메일" 형식이 반드시 필요하다
+(SEC 정책 — 인증키는 아니지만 요청 시 빠지면 차단될 수 있다). 이 스크립트는
+--contact 인자로 받거나 환경변수 SEC_CONTACT_EMAIL을 쓴다.
 """
 import argparse
 import json
@@ -16,12 +17,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR.parent / "cache"
+TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
-# 자주 쓰는 기업만 담는다. 개수를 부풀리지 않는다 — 여기 없으면 사용자가
-# Ticker를 직접 입력하도록 명확히 안내하는 편이, "아마 이거겠지" 하고
-# 틀린 회사를 매칭하는 것보다 훨씬 안전하다.
+# 자주 쓰는 기업의 한글/영문 라벨 → Ticker. SEC의 공식 매핑(전체 상장사)과
+# 별개로, 사용자가 한글로 물어봤을 때 바로 대응하기 위한 보조 사전이다.
 COMMON_TICKERS = {
-    # 빅테크
     "애플": "AAPL", "apple": "AAPL",
     "마이크로소프트": "MSFT", "microsoft": "MSFT",
     "구글": "GOOGL", "google": "GOOGL", "알파벳": "GOOGL", "alphabet": "GOOGL",
@@ -38,7 +38,6 @@ COMMON_TICKERS = {
     "IBM": "IBM", "아이비엠": "IBM",
     "퀄컴": "QCOM", "qualcomm": "QCOM",
     "브로드컴": "AVGO", "broadcom": "AVGO",
-    # 금융
     "jp모건": "JPM", "jpmorgan": "JPM",
     "뱅크오브아메리카": "BAC", "bank of america": "BAC",
     "웰스파고": "WFC", "wells fargo": "WFC",
@@ -49,7 +48,6 @@ COMMON_TICKERS = {
     "마스터카드": "MA", "mastercard": "MA",
     "페이팔": "PYPL", "paypal": "PYPL",
     "버크셔해서웨이": "BRK-B", "berkshire hathaway": "BRK-B",
-    # 소비재/기타
     "코카콜라": "KO", "coca-cola": "KO", "coca cola": "KO",
     "펩시": "PEP", "pepsi": "PEP", "pepsico": "PEP",
     "맥도날드": "MCD", "mcdonald's": "MCD", "mcdonalds": "MCD",
@@ -65,71 +63,106 @@ COMMON_TICKERS = {
 }
 
 
+def _explain_error(e: Exception) -> str:
+    msg = str(e)
+    if "403" in msg:
+        return f"{msg} — SEC가 요청을 차단했습니다. User-Agent 헤더(연락처 이메일 포함)가 올바른지 확인하세요."
+    if "429" in msg:
+        return f"{msg} — SEC 레이트리밋(초당 10회 제한). 요청 간격을 늘리세요."
+    return msg
+
+
+def _headers(contact_email: str) -> dict:
+    if not contact_email or "@" not in contact_email:
+        raise ValueError(
+            "SEC EDGAR는 User-Agent에 유효한 연락처 이메일이 필요합니다. "
+            "--contact your@email.com 형태로 전달하세요(SEC 정책)."
+        )
+    return {"User-Agent": f"us-stocks-financials-plugin {contact_email}"}
+
+
+def fetch_all_tickers(contact_email: str, cache_dir: Path = CACHE_DIR) -> dict:
+    """SEC의 전체 티커→CIK 매핑을 받아 캐시한다(하루에 한 번 정도면 충분 —
+    상장 변동이 매일 나는 게 아니므로 캐시가 있으면 재사용한다)."""
+    import requests
+
+    cache_file = cache_dir / "sec_company_tickers.json"
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            return cached
+        except Exception:
+            pass
+
+    try:
+        resp = requests.get(TICKERS_URL, headers=_headers(contact_email), timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        print(f"FAIL SEC 티커 매핑 다운로드 실패: {_explain_error(e)}", file=sys.stderr)
+        return {}
+
+    # raw 형태: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
+    by_ticker = {}
+    for entry in raw.values():
+        t = entry.get("ticker", "").upper()
+        if t:
+            by_ticker[t] = {"cik": str(entry["cik_str"]).zfill(10), "title": entry.get("title", "")}
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(by_ticker, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"SAVE SEC 티커 매핑 {len(by_ticker)}개 저장: {cache_file}")
+    return by_ticker
+
+
 def lookup_ticker(company_name: str) -> str | None:
-    """알려진 매핑에 있으면 티커를 반환하고, 없으면 None(실패)을 반환한다.
-    "5자 이내 영문이면 그냥 티커로 간주" 같은 추측은 하지 않는다 — 존재하지
-    않는 티커를 그대로 넘겨서 나중 단계에서 원인 불명확한 에러가 나느니,
-    여기서 명확히 실패시키는 편이 사용자 경험상 낫다(이후 단계에서
-    ticker_obj.info로 실존 여부를 검증하므로 그 결과가 훨씬 명확하다)."""
     normalized = company_name.strip().lower()
     return COMMON_TICKERS.get(normalized)
 
 
-def verify_ticker_exists(ticker: str) -> tuple[bool, dict | None]:
-    """yfinance로 해당 티커가 실제로 존재하는지 확인한다. 매핑에 없는
-    기업이거나, 사용자가 티커를 직접 입력한 경우 둘 다 이 함수로 검증한다."""
-    import yfinance as yf
-
-    try:
-        t = yf.Ticker(ticker.upper())
-        info = t.info
-        if info and info.get("longName"):
-            return True, info
-        return False, None
-    except Exception as e:
-        print(f"WARN {ticker} 조회 중 오류: {e}", file=sys.stderr)
-        return False, None
+def resolve_cik(ticker: str, contact_email: str) -> tuple[str | None, str | None]:
+    """Ticker로 CIK와 공식 회사명을 찾는다. 반환: (cik, title) 또는 (None, None)."""
+    all_tickers = fetch_all_tickers(contact_email)
+    entry = all_tickers.get(ticker.upper())
+    if entry:
+        return entry["cik"], entry["title"]
+    return None, None
 
 
-def save_company_info(ticker: str, info: dict, cache_dir: Path = CACHE_DIR):
+def save_company_info(ticker: str, cik: str, title: str, cache_dir: Path = CACHE_DIR):
     cache_dir.mkdir(parents=True, exist_ok=True)
     company_info = {
-        "ticker": ticker,
-        "longName": info.get("longName", ""),
-        "sector": info.get("sector", ""),
-        "industry": info.get("industry", ""),
-        "currency": info.get("currency", ""),
-        "exchange": info.get("exchange", ""),
+        "ticker": ticker.upper(), "cik": cik, "title": title,
         "fetched_at": datetime.now().isoformat(),
     }
-    cache_file = cache_dir / f"company_{ticker}.json"
+    cache_file = cache_dir / f"company_{ticker.upper()}.json"
     cache_file.write_text(json.dumps(company_info, ensure_ascii=False, indent=2), encoding="utf-8")
     return company_info
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="기업명 → Ticker 변환")
+    ap = argparse.ArgumentParser(description="기업명/Ticker → SEC CIK 변환")
     ap.add_argument("company_name", help="기업명(한글/영문) 또는 Ticker 심볼")
+    ap.add_argument("--contact", required=True, help="SEC User-Agent에 넣을 연락처 이메일(필수, SEC 정책)")
     args = ap.parse_args()
 
     ticker = lookup_ticker(args.company_name)
     if ticker is None:
-        # 매핑에 없으면 사용자가 준 문자열 자체를 티커 후보로 보고 실존 여부만 검증한다.
         ticker = args.company_name.strip().upper()
 
-    ok, info = verify_ticker_exists(ticker)
-    if not ok:
+    cik, title = resolve_cik(ticker, args.contact)
+    if cik is None:
         print(
-            f"FAIL '{args.company_name}'을(를) 찾을 수 없습니다. "
-            f"정확한 Ticker 심볼을 직접 입력해주세요(예: AAPL).",
+            f"FAIL '{args.company_name}'(Ticker: {ticker})을(를) SEC 매핑에서 찾을 수 없습니다. "
+            "정확한 Ticker 심볼을 확인해주세요.",
             file=sys.stderr,
         )
         print(json.dumps({"found": False, "input": args.company_name}, ensure_ascii=False))
         sys.exit(1)
 
-    save_company_info(ticker, info)
-    print(f"OK {args.company_name} -> {ticker} ({info.get('longName', '')})")
-    print(json.dumps({"found": True, "ticker": ticker, "longName": info.get("longName", "")}, ensure_ascii=False))
+    save_company_info(ticker, cik, title)
+    print(f"OK {args.company_name} -> {ticker} (CIK {cik}, {title})")
+    print(json.dumps({"found": True, "ticker": ticker, "cik": cik, "title": title}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
