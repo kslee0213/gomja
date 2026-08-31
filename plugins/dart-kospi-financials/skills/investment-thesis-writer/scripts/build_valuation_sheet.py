@@ -116,6 +116,7 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
         "자산총계": find_row(ind, "자산총계", col=2),
     }
     ia_row = {
+        "FCF": find_row(ia, "FCF = 영업활동현금흐름 - CAPEX"),
         "감가상각비": find_row(ia, "감가상각비"),
         "유형자산의취득": find_row(ia, "유형자산의취득"),
         "종가": find_row(ia, "종가"),
@@ -225,15 +226,22 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     _y_last = re.match(r"(\d{4})", str(period_labels[last_i]))
     years_span = (int(_y_last.group(1)) - int(_y_first.group(1))) if (_y_first and _y_last) else last_i
     years_span = max(years_span, 1)
+    # 순이익이 어느 한쪽이라도 0 이하이면 CAGR이 정의되지 않는다(적자 축소를 '마이너스 성장'으로 읽는 오류 방지).
     cagr_formula = (
-        f"=IFERROR(SIGN({ni_last})*SIGN({ni_first})*(({ni_last}/{ni_first})^(1/{years_span})-1),\"\")"
+        f"=IFERROR(IF(OR({ni_first}<=0,{ni_last}<=0),\"\",({ni_last}/{ni_first})^(1/{years_span})-1),\"\")"
         if ni_first and ni_last and years_span > 0 else None
     )
     cagr_row = snap_row(f"실제 순이익 CAGR ({years_span}개년 환산)", cagr_formula, "0.0%")
-    asset_iv_row = snap_row("자산기반 내재가치 = BPS×10", f"=IFERROR(B{bps_row}*10,\"\")" if bps_row else None, "#,##0")
+    # [제안] 기존 "BPS×10"은 장부가의 10배를 내재가치로 보는 산식이라 거의 모든 종목이 '자산기반 저평가'로 나온다.
+    # 그레이엄의 자산 기준(그레이엄 넘버 √(22.5×EPS×BPS), EPS≤0이면 BPS×1.5)으로 교체. 원 참고자료 산식과 다르면 되돌릴 것.
+    asset_iv_row = snap_row(
+        "자산기반 내재가치 = 그레이엄넘버 √(22.5×EPS×BPS) (EPS≤0이면 BPS×1.5)",
+        f"=IFERROR(IF(B{eps_row}>0,SQRT(22.5*B{eps_row}*B{bps_row}),B{bps_row}*1.5),\"\")" if (bps_row and eps_row) else None,
+        "#,##0",
+    )
     growth_iv_row = snap_row(
-        "성장주 내재가치 = EPS×(8.5+2×기대성장률%)",
-        f"=IFERROR(B{eps_row}*(8.5+2*B{cagr_row}*100),\"\")" if eps_row and cagr_row else None,
+        "성장주 내재가치 = EPS×(8.5+2×기대성장률%), 성장률 15% 상한",
+        f"=IFERROR(IF(B{eps_row}<=0,\"\",B{eps_row}*(8.5+2*MIN(B{cagr_row},0.15)*100)),\"\")" if eps_row and cagr_row else None,
         "#,##0",
     )
     snap_row("현재 종가", f"={price_ref}" if price_ref else None, "#,##0")
@@ -292,7 +300,18 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     ws.cell(row=row, column=1, value="영구성장률(g)"); ws.cell(row=row, column=2, value=g_pct / 100).number_format = "0.0%"
     g_cell = f"$B${row}"
     row += 1
-    row += 1
+    # DART API에는 감가상각비(주석 항목)가 없는 회사가 많아 오너어닝이 비는 경우가 흔하다.
+    # 그 경우 '투자분석' F섹션의 FCF(영업활동현금흐름−CAPEX, OCF에 이미 감가상각비가 가산돼 있음)로 폴백한다.
+    _oe_col_last = get_column_letter(3 + last_i)
+    fcf_ref = ia_ref("FCF", last_i)
+    ws.cell(row=row, column=1, value="DCF 기준 현금흐름(최신연도) = 오너어닝, 없으면 FCF 폴백")
+    if fcf_ref:
+        ws.cell(row=row, column=3, value=f"=IF(ISNUMBER({_oe_col_last}{oe_row}),{_oe_col_last}{oe_row},{fcf_ref})").number_format = "#,##0.0"
+    else:
+        ws.cell(row=row, column=3, value=f"={_oe_col_last}{oe_row}").number_format = "#,##0.0"
+    ws.cell(row=row, column=4, value="※ 오너어닝이 비어 있으면(감가상각비 미공시) 투자분석 F섹션의 FCF를 씁니다").font = NOTE_FONT
+    base_cf_row = row
+    row += 2
 
     dcf_header = row
     ws.cell(row=row, column=1, value="연차")
@@ -303,7 +322,7 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     row += 1
 
     oe_col_last = get_column_letter(3 + last_i)
-    oe_base = f"'{ws.title}'!{oe_col_last}{oe_row}"
+    oe_base = f"$C${base_cf_row}"
 
     oe_proj_row = row
     ws.cell(row=row, column=1, value="예측 오너 어닝")
@@ -339,7 +358,7 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     row += 1
     total_iv_row = row
     ws.cell(row=row, column=1, value="DCF 내재가치 합계 (기업 전체, 억원)").font = Font(name=FONT_NAME, bold=True)
-    ws.cell(row=row, column=3, value=f"=C{sum_pv_row}+C{tv_pv_row}").number_format = "#,##0.0"
+    ws.cell(row=row, column=3, value=f"=IFERROR(C{sum_pv_row}+C{tv_pv_row},\"\")").number_format = "#,##0.0"
     row += 1
 
     mktcap_ref = ia_ref("시가총액", last_i)
