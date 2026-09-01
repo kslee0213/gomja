@@ -1,7 +1,0 @@
-{
-  "name": "valuation-verdict",
-  "version": "1.0.0",
-  "dex-scription": "dart-kospi-financials / us-stocks-financials가 만든 캐시·워크북을 입력받아 기업가치 대비 주가의 과소/과대평가 '결론'을 냅니다. 자산가치(bps×정당pbr)·수익가치(정상화eps×목표per)·fcf 2단계 dcf·잔여이익모델(rim)·ddm을 같은 잣대로 계산해 가중 평균 적정주가, 괴리율, 비관/기준/낙관 목표주가 범위, 판정(저평가~고평가 5단계), 신뢰도와 기본값 사용 가정 목록을 '가치평가_결론' 시트(가정=입력셀, 계산=수식)·json·마크다운으로 출력합니다. 한국·미국 공용.",
-  "author": {"name": "user"},
-  "keywords": ["적정주가", "목표주가", "저평가", "고평가", "괴리율", "fair value", "dcf", "rim", "per", "pbr", "가치평가", "투자판단"]
-}
