@@ -1,6 +1,3 @@
-plugins/valuation-verdict/ 폴더를 추가하고, 이 6개 변경을 한꺼번에 커밋·푸시하면 됩니다. marketplace.json이 들어 있는데 내용이 동일하니 어느 쪽으로 덮어써도 상관없습니다.
-
-
 valuation-verdict
 `dart-kospi-financials`(한국)와 `us-stocks-financials`(미국)가 만든 재무 캐시·워크북을 받아 **"지금 주가가 기업가치 대비 싼가 비싼가, 적정주가는 얼마고 어디까지 갈 수 있나"**를 한 장의 시트와 한 줄의 판정으로 끝낸다.
 무엇이 나오나
