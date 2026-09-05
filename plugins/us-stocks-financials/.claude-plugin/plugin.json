@@ -1,9 +1,22 @@
 {
   "name": "us-stocks-financials",
-  "version": "3.0.0",
-  "description": "미국 나스닥/NYSE 상장 기업의 재무제표를 SEC EDGAR 공식 API(무료, 키불필요)로 수집해 엑셀 분석 파일을 생성합니다. 주가만 yfinance를 최소한으로 사용합니다. dart-kospi-financials와 동일한 설계 원칙(원본데이터 시트 + 수식 기반 감사 가능성)을 따릅니다. 분기_재무제표/연간_재무제표/지표_분기/지표_연간(차트 포함)/투자분석/원본데이터 시트를 만들고, 여러 기업의 실제 시계열 데이터를 비교하는 기능도 지원합니다.",
+  "version": "4.0.0",
+  "description": "미국 나스닥/NYSE 상장 기업의 재무제표를 SEC EDGAR 공식 API(무료, 키불필요)로 수집해 dart-kospi-financials와 동일한 구성의 분석 엑셀을 생성합니다: 분기/연간 재무제표, 지표+차트 6개, 투자분석 A~N 섹션(재무지표 4그룹·위험신호·청산가치·CCC·FCF·현금흐름 3단·DuPont·ROIC·연도별 주가지표·배당·투자판단 자동평가), 그리고 investment-thesis-writer(투자판단 종합·버핏멍거_가치평가)와 valuation-verdict(가치평가_결론)를 그대로 재사용합니다. 주가·월말 종가 이력·배당은 yfinance를 최소한으로 사용합니다.",
   "author": {
     "name": "User"
   },
-  "keywords": ["sec-edgar", "xbrl", "미국주식", "재무제표", "엑셀", "비교", "투자분석", "nasdaq", "nyse"]
+  "keywords": [
+    "sec-edgar",
+    "xbrl",
+    "미국주식",
+    "재무제표",
+    "엑셀",
+    "비교",
+    "투자분석",
+    "투자판단",
+    "가치평가",
+    "적정주가",
+    "nasdaq",
+    "nyse"
+  ]
 }

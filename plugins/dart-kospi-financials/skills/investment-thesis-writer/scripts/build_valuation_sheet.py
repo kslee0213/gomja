@@ -82,7 +82,10 @@ def style_header(ws, row: int, min_col: int, max_col: int):
         c.alignment = Alignment(horizontal="center")
 
 
-def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None = None) -> str:
+def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None = None,
+                          unit_label: str = "억원", unit_mult: int = 100_000_000) -> str:
+    """unit_label/unit_mult: 워크북 금액 단위(기본 억원=1e8원). 미국 워크북은
+    "백만달러"/1_000_000으로 호출한다 — 주당 환산과 단위 표기에 쓰인다."""
     wb = load_workbook(src_path)
     if "지표_연간" not in wb.sheetnames or "투자분석" not in wb.sheetnames:
         print("ERROR: 원본 파일에 '지표_연간'/'투자분석' 시트가 필요합니다. "
@@ -129,7 +132,7 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
 
     row = 1
     ws.cell(row=row, column=1, value="버핏-멍거 가치평가").font = TITLE_FONT
-    ws.cell(row=row, column=4, value="(금액 단위: 억원, 참고자료: 워렌버핏과 찰리멍거)").font = NOTE_FONT
+    ws.cell(row=row, column=4, value=f"(금액 단위: {unit_label}, 참고자료: 워렌버핏과 찰리멍거)").font = NOTE_FONT
     row += 2
     if missing:
         ws.cell(row=row, column=1, value=(
@@ -357,26 +360,26 @@ def build_valuation_sheet(src_path: str, content_path: str, outdir: str | None =
     ws.cell(row=row, column=3, value=f"=IFERROR(C{tv_row}/(1+{r_cell})^{proj_n},\"\")").number_format = "#,##0.0"
     row += 1
     total_iv_row = row
-    ws.cell(row=row, column=1, value="DCF 내재가치 합계 (기업 전체, 억원)").font = Font(name=FONT_NAME, bold=True)
+    ws.cell(row=row, column=1, value=f"DCF 내재가치 합계 (기업 전체, {unit_label})").font = Font(name=FONT_NAME, bold=True)
     ws.cell(row=row, column=3, value=f"=IFERROR(C{sum_pv_row}+C{tv_pv_row},\"\")").number_format = "#,##0.0"
     row += 1
 
     mktcap_ref = ia_ref("시가총액", last_i)
     shares_row = row
-    ws.cell(row=row, column=1, value="상장주식수 역산(시가총액[억원]×1억/종가[원])")
+    ws.cell(row=row, column=1, value=f"상장주식수 역산(시가총액[{unit_label}]×{unit_mult:,}/종가)")
     if mktcap_ref and price_ref:
-        ws.cell(row=row, column=3, value=f"=IFERROR({mktcap_ref}*100000000/{price_ref},\"\")").number_format = "#,##0"
+        ws.cell(row=row, column=3, value=f"=IFERROR({mktcap_ref}*{unit_mult}/{price_ref},\"\")").number_format = "#,##0"
     row += 1
     dcf_per_share_row = row
-    ws.cell(row=row, column=1, value="DCF 주당 내재가치 (억원/주 → 원 환산)").font = Font(name=FONT_NAME, bold=True)
-    ws.cell(row=row, column=3, value=f"=IFERROR(C{total_iv_row}/C{shares_row}*100000000,\"\")").number_format = "#,##0"
+    ws.cell(row=row, column=1, value=f"DCF 주당 내재가치 ({unit_label}/주 → 통화 단위 환산)").font = Font(name=FONT_NAME, bold=True)
+    ws.cell(row=row, column=3, value=f"=IFERROR(C{total_iv_row}/C{shares_row}*{unit_mult},\"\")").number_format = "#,##0"
     row += 1
     ws.cell(row=row, column=1, value="안전마진(DCF) = (DCF주당내재가치−종가)/DCF주당내재가치")
     if price_ref:
         ws.cell(row=row, column=3, value=f"=IFERROR((C{dcf_per_share_row}-{price_ref})/C{dcf_per_share_row},\"\")").number_format = "0.0%"
     row += 2
     ws.cell(row=row, column=1, value=(
-        "※ 종가는 원 단위, 시가총액·오너어닝은 억원 단위라 주당 내재가치 계산에서 1억을 곱해 단위를 맞췄습니다."
+        f"※ 종가는 통화 단위, 시가총액·오너어닝은 {unit_label} 단위라 주당 내재가치 계산에서 {unit_mult:,}을 곱해 단위를 맞췄습니다."
     )).font = NOTE_FONT
     row += 2
 
@@ -433,8 +436,11 @@ def main() -> None:
         "--outdir", default=None,
         help="지정하지 않으면(기본값) src_xlsx에 시트를 추가해 같은 파일로 덮어쓴다.",
     )
+    ap.add_argument("--unit-label", default="억원", help="워크북 금액 단위 표기(미국 워크북은 백만달러)")
+    ap.add_argument("--unit-multiplier", type=int, default=100_000_000, help="단위→통화 환산 배수(억원=100000000, 백만달러=1000000)")
     args = ap.parse_args()
-    outfile = build_valuation_sheet(args.src_xlsx, args.content_json, args.outdir)
+    outfile = build_valuation_sheet(args.src_xlsx, args.content_json, args.outdir,
+                                    unit_label=args.unit_label, unit_mult=args.unit_multiplier)
     print(json.dumps({"saved": outfile}, ensure_ascii=False))
 
 

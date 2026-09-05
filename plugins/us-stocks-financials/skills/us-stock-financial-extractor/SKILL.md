@@ -5,115 +5,112 @@ description: >
   (NASDAQ/NYSE) company financial statements, such as "애플 재무제표 뽑아줘",
   "테슬라 년 분석해줘", "AAPL 분기 분석해줘", or requests to compare multiple US
   companies like "마이크로소프트, 구글 비교해줘". Financial statements come from
-  SEC EDGAR's official free XBRL API (no key required, no scraping risk);
-  current stock price comes from yfinance (minimal use only). This is the US
-  counterpart to dart-kospi-financials, built on the same design principle
-  (formula-based audit trail via a raw-data sheet, embedded charts).
+  SEC EDGAR's official free XBRL API (no key required); stock price/history comes
+  from yfinance. This is the US counterpart to dart-kospi-financials with the
+  SAME sheet structure and analysis content (재무제표, 지표+차트, 투자분석 A~N,
+  투자판단 종합, 버핏멍거_가치평가, 가치평가_결론) and the same audit principle
+  (formula-based audit trail via a raw-data sheet).
 metadata:
-  version: "3.0.0"
+  version: "4.0.0"
 ---
 
 # US Stock Financial Extractor
 
-기업명(또는 Ticker)을 입력받아 재무제표를 수집하고, 분기·연간 재무제표와 재무지표, 간이 투자분석을 담은 엑셀 파일을 만든다.
+기업명(또는 티커)을 입력받아 SEC EDGAR에서 재무제표를 수집하고, **dart-kospi-financials와 동일한 구성**의 분석 엑셀을 만든다. 버전 이력은 `CHANGELOG.md` 참고.
 
-> ⚠️ **v2.0.0(yfinance 전면 사용) → v3.0.0(SEC EDGAR 전환)**. v2.0.0은 재무제표까지 yfinance로 가져왔는데, yfinance는 비공식 스크레이핑이라 Yahoo가 클라우드 IP를 403으로 차단하는 문제가 실제로 발생했다(다른 세션에서 재현됨). v3.0.0은 재무제표를 **SEC(미국 증권거래위원회)가 직접 제공하는 공식 무료 API(data.sec.gov)**로 전환했다 — DART Open API와 원리가 같다(XBRL 표준계정 태그 기반). yfinance는 SEC가 제공하지 않는 "현재 주가" 하나만 위해 최소한으로만 남겼다.
-
-## 데이터 소스 구조 (중요)
-
-| 데이터 | 소스 | 특징 |
-|---|---|---|
-| 재무제표(BS/IS/CF) | **SEC EDGAR** (`data.sec.gov`) | 공식 정부 API, 완전 무료, **API 키 불필요**(단 User-Agent에 연락처 이메일 필요 — 인증키 아님), 차단 위험 낮음(비공식 스크레이핑이 아니라 진짜 API) |
-| 현재 주가·시가총액 | yfinance (Yahoo Finance) | 여전히 비공식이라 403/429 위험이 남아있음. 이 부분만 실패해도 재무제표는 영향받지 않는다(투자분석의 PER/PBR 등 주가 연동 지표만 빈다) |
+> **절대 규칙: "OO 년 분석해줘"는 확인 질문 없이 전체 파이프라인을 실행한다.** KR과 동일하게 "가치평가_결론+재무제표+투자분석+투자판단 종합+버핏멍거_가치평가를 전부 담은 파일 하나(7개 시트)"가 기본 산출물이다. 사용자가 "재무제표만"이라고 명시한 경우에만 4단계 이후를 건너뛴다.
 
 ## 0. 사전 준비
 
-```bash
-pip install requests openpyxl --break-system-packages   # SEC EDGAR용, 대부분 이미 설치돼 있음
-pip install yfinance --break-system-packages              # 주가 전용, 선택이지만 강력 권장
-```
+| 항목 | 내용 |
+|---|---|
+| 패키지 | `pip install requests openpyxl yfinance --break-system-packages` |
+| 연락처 이메일 | SEC는 API 키 대신 User-Agent에 유효한 이메일을 요구한다(없으면 403 위험). 대화에 없으면 시작 전에 사용자에게 요청. |
+| 네트워크 | `data.sec.gov`·`www.sec.gov`(재무제표, 필수), `query1/2.finance.yahoo.com`(주가, 권장)이 허용 목록에 있어야 한다. |
+| yfinance 실패 시 | 재무제표(SEC)는 계속 진행하고 "주가 연동 지표만 못 채웠다"고 정확히 알린다. **조용히 웹 검색 수동 리포트로 전환하지 않는다.** 재시도는 1~2회만. |
 
-### 0-0. 작업 시작 전 필수 확인
-
-1. **연락처 이메일**: SEC EDGAR는 API 키는 없지만 User-Agent 헤더에 유효한 이메일이 반드시 있어야 한다(SEC 정책 — 없으면 403 위험). 대화에 없으면 먼저 사용자에게 물어본다: "SEC API 호출 시 User-Agent에 넣을 연락처 이메일을 알려주세요(예: you@example.com)."
-2. **네트워크 허용 목록**: `data.sec.gov`가 Cowork 네트워크 허용 목록에 없으면 접근이 막힌다(이 채팅 환경에서 직접 확인됨 — `data.sec.gov`가 차단되어 있었다). 접근이 안 되면 DART 때처럼 이 채팅 환경과 사용자의 Cowork 실행 환경이 다를 수 있다는 점을 안내하고, Cowork 설정에서 이 도메인을 추가해달라고 요청한다.
-3. yfinance는 선택이다 — 없어도 재무제표(핵심 산출물)는 정상 생성되고, 주가 연동 지표만 빈다.
-
-### ⚠️ yfinance(주가)가 403/429로 막힐 때의 대응
-
-`fetch_extra_info.py` 실행 중 403/429가 나면:
-1. **절대로 조용히 다른 방식(웹 검색 기반 수동 리포트 등)으로 전환하지 않는다.** 재무제표(SEC EDGAR)는 정상 작동하니, 이 부분은 그대로 진행하고 "주가 연동 지표만 못 채웠다"고 정확히 알린다.
-2. 재시도는 1~2회만 짧게 시도한다.
-3. `data.sec.gov`가 아니라 `query1/2.finance.yahoo.com`이 막힌 것이므로, SEC 기반 재무제표 작업 자체를 멈추지 않는다.
-
-## 1. 기업명 → Ticker → CIK 변환
+## 1. 기업명 → Ticker → CIK
 
 ```
-python scripts/ticker_lookup.py <기업명 또는 Ticker> --contact <연락처이메일>
+python scripts/ticker_lookup.py <기업명 또는 티커> --contact <이메일>
 ```
+한글/영문 별칭 사전에 없으면 입력을 티커로 간주하고, SEC 공식 매핑(`company_tickers.json`, 캐시)에서 CIK를 찾는다. 못 찾으면 정확한 티커를 요청한다.
 
-- `COMMON_TICKERS`에 38개 고유 기업(한글/영문 라벨 합쳐 83개)이 매핑되어 있다. 없으면 입력을 Ticker로 간주한다.
-- SEC의 공식 전체 티커→CIK 매핑(`sec.gov/files/company_tickers.json`, 역시 키 불필요)을 한 번 받아 캐시해두고 재사용한다(회사마다 개별 조회 불필요).
-- CIK를 못 찾으면 명확히 실패를 알리고 정확한 Ticker를 요청한다.
-
-## 2. 재무제표 수집 (SEC EDGAR)
+## 2. 데이터 수집
 
 ```
-python scripts/fetch_financials.py <ticker> <10자리CIK> --contact <연락처이메일>
-python scripts/fetch_extra_info.py <ticker>   # 주가(yfinance, 선택)
+python scripts/fetch_financials.py <ticker> <10자리CIK> --contact <이메일>   # SEC 재무제표(필수)
+python scripts/fetch_extra_info.py <ticker>                                  # 주가·월말 종가 7년·배당 이력(yfinance)
 ```
 
-- `fetch_financials.py`는 `https://data.sec.gov/api/xbrl/companyfacts/CIK{10자리}.json`을 **통째로** 받아 `cache/secfacts_{ticker}.json`에 원본 그대로 저장한다(가공은 build_workbook.py가 읽을 때 한다 — 나중에 새 계정을 추가하고 싶어도 재조회 불필요).
-- **레이트리밋**: 초당 10회. 기업 하나당 요청 1회로 끝나므로 순차 처리하면 문제없다. 여러 기업을 연속 조회할 때 `time.sleep(0.15)` 정도의 간격을 둔다(스크립트에 이미 포함됨).
-- 캐시가 있으면 재사용한다(`--force`로 강제 재조회).
-
-### duration 계정(손익계산서/현금흐름표) 파싱 주의
-
-같은 계정(예: 매출액)에 3개월(분기단독)/6개월/9개월/12개월(연간) 값이 전부 섞여서 응답에 들어있다. `(end-start)` 일수로 80~100일=분기, 350~380일=연간을 걸러낸다(`fetch_financials.py`의 `_duration_days()`). **재무상태표(instant) 항목은 이 duration 계정들의 실제 연간/분기 날짜와 매칭되는 것만 각 세트(quarterly/annual)에 넣는다** — 그렇지 않으면 아직 10-K가 없는 진행 중인 분기말 BS 스냅샷이 "연간" 쪽에 잘못 섞여 들어가는 버그가 생긴다(실제로 재현·수정됨, `references/sec_edgar_xbrl_reference.md` 참고).
+- CompanyFacts JSON을 통째로 `cache/secfacts_{ticker}.json`에 저장한다(재조회 불필요, `--force`로 갱신).
+- `fetch_extra_info.py`는 현재가·시총·상장주식수에 더해 **월말 종가 7년 이력**과 **연도별 주당 배당 합계**를 가져온다 — 투자분석 L섹션(연도별 PER/PBR/PSR)과 N섹션 저평가 등급, 가치평가의 과거 PER 밴드에 쓰인다. 이력 조회가 실패해도 현재가만으로 계속 진행한다.
 
 ## 3. 엑셀 생성
 
 ```
-python scripts/build_workbook.py <ticker> "<기업명>" --period both --quarters 12 --years 5 --outdir /mnt/user-data/outputs
+python scripts/build_workbook.py <ticker> "<기업명>" --period {annual|quarterly|both} --outdir /mnt/user-data/outputs
 ```
 
-### 생성되는 시트
+`--period` 판단은 KR과 동일: "년"→annual(`_연간`), "분기"→quarterly(`_분기`), 없으면 both. 생성 시트(연간 기준)는 KR과 동일 구성이다:
 
 | 시트 | 내용 |
 |---|---|
-| `분기_재무제표` | 있는 만큼의 분기(SEC 공시 이력에 따라 다름, 보통 여러 개년치 다 있을 수 있음 — yfinance의 4~5개 제약과 달리 SEC는 회사가 XBRL 공시를 시작한 이후 전체 이력을 제공) |
-| `연간_재무제표` | 있는 만큼의 연도 |
-| `지표_분기` / `지표_연간` | 11개 재무비율 + 라인차트 4개 |
-| `투자분석` | A.재무비율 요약 B.위험신호 C.주가 연동 지표(PER/PBR/PSR을 **직접 수식으로 계산** — yfinance의 완제품 값을 그대로 안 믿음) D.간이 투자판단 |
-| `원본데이터` | SEC/yfinance에서 뽑은 raw 값(숨김). 다른 모든 시트가 이 시트를 수식으로 참조 |
+| 분기_재무제표 / 연간_재무제표 | 손익·재무상태·현금흐름, 원본데이터 시트 참조 수식. 단위 백만달러(EPS는 달러). |
+| 지표_분기 / 지표_연간 | 기본 지표 14개 + 비율 6개 + 임베드 차트 6개(KR과 동일 그룹) |
+| 투자분석 (연간 전용) | A 회사 개황 / B 재무지표(건전성·수익성·성장성·활동성) / C 위험신호 6종 / D 청산가치(비율 셀참조) / E CCC / F FCF / G 현금흐름 3단 / H DuPont / I ROIC·NOPLAT(간이) / J 구성비 / K 외환손익 / L 주가 연동(연도별 종가·시총·PER·PBR·PSR + 현재가 블록) / M 배당 / N 투자판단 자동평가(A~E, KR과 동일 규칙) + 섹션별 차트 |
+| 원본데이터 (숨김) | SEC 원본값(달러). 모든 시트의 유일한 소스. |
 
-- PER = 현재가 ÷ EPS(SEC), PBR = 현재가 ÷ (자본총계÷상장주식수), PSR = 현재가 ÷ (매출액÷상장주식수) — 전부 감사 가능한 수식.
+미국 공시 체계상 KR과 다른 점(지어내지 않고 명시): 과거 시가총액은 "현재 상장주식수 × 당시 종가" 근사치, 대주주·자기주식은 범위 밖(M섹션에 문구), 감가상각비는 SEC 태그로 잘 잡히는 편(오너어닝 계산 가능성이 KR보다 높음).
 
-## 4. 여러 기업 비교
+## 4. 투자판단 종합·가치평가·결론까지 이어서 (KR 5-3단계와 동일)
+
+`--period annual`(또는 both)로 투자분석 시트를 만들었으면 멈추지 말고 이어서 실행한다:
+
+1. 사업 내용 파악: DART 원문 대신 **웹 검색 + 최신 10-K의 Item 1(Business) 요약**을 쓴다(WebFetch로 SEC 사이트 열람 가능 시). 산업 동향·경쟁사·점유율·리스크·금리를 리서치하고 출처를 남긴다.
+2. `content.json`(투자판단 종합) + `valuation_content.json`(버핏멍거_가치평가) 작성 — 스키마는 `investment-thesis-writer/SKILL.md` 참고. 정량 시트(N섹션 등급 등)와 모순되지 않게 쓴다.
+3. 같은 파일에 시트 추가 (**`--outdir` 지정 금지, 단위 옵션 필수**):
+   ```
+   python plugins/dart-kospi-financials/skills/investment-thesis-writer/scripts/build_thesis_sheet.py \
+       <xlsx> content.json --unit-label 백만달러
+   python plugins/dart-kospi-financials/skills/investment-thesis-writer/scripts/build_valuation_sheet.py \
+       <xlsx> valuation_content.json --unit-label 백만달러 --unit-multiplier 1000000
+   ```
+   ⚠ `--unit-multiplier 1000000`을 빠뜨리면 주당 내재가치가 100배 틀어진다(기본값이 KR 억원=1e8).
+4. **가치평가_결론**:
+   ```
+   python plugins/valuation-verdict/skills/valuation-verdict/scripts/valuation_verdict.py \
+       --source sec --cache-dir <이 스킬의 cache 폴더> --ticker <티커> \
+       --xlsx <같은 xlsx> [--assumptions assumptions.json]
+   ```
+   가정(rf=미국채 10년, β, ERP 4~6%, 목표 PER)은 1번 리서치로 채워 `--assumptions`로 넘긴다. 결과 해석은 valuation-verdict SKILL.md 3~4번을 따른다.
+5. 마지막에 `python /mnt/skills/public/xlsx/scripts/recalc.py <xlsx>`로 수식 오류를 확인한다. **`#N/A`는 "해당 기간 데이터 없음" 표시로 의도된 값이다**(분기 데이터가 성긴 과거 연도 등) — N/A 외의 오류(#VALUE!, #REF! 등)가 0인지 확인하고, N/A가 어느 시트에 몇 개인지 요약에 알린다.
+
+## 5. 여러 기업 비교
 
 ```
-python scripts/build_comparison_workbook.py AAPL:Apple MSFT:Microsoft --quarters 12 --years 5 --outdir /mnt/user-data/outputs
+python scripts/build_comparison_workbook.py AAPL:Apple MSFT:Microsoft --outdir /mnt/user-data/outputs
 ```
+각 기업의 `fetch_financials.py` 캐시가 먼저 있어야 한다. `12분기 비교`/`최근5년 비교` 시트에 지표 17개 표+차트.
 
-비교 대상 기업은 먼저 각각 `fetch_financials.py`로 캐시를 만들어둬야 한다. `12분기 비교`/`최근5년 비교` 시트는 각 기업의 실제 캐시된 시계열을 읽어 서로 다른 값을 보여준다(v1.0.0의 동일값 버그는 v2.0.0에서 이미 수정, v3.0.0은 데이터 소스만 SEC로 교체).
+## 6. 저장 및 전달
 
-## 5. 저장 및 전달
+완료 요약: 채워진 분기/연도 수, 못 찾은 계정 목록(`missing_indicators`), 주가 이력 사용 여부(`price_history_used`), 4단계까지 했다면 리서치 출처·가정 근거·**가치평가_결론의 한 줄 판정**.
 
-완료 후 요약: 실제로 채워진 분기/연도 개수, 못 찾은 계정 목록(SEC 태그 후보가 다 실패한 경우), 주가 지표 중 못 가져온 항목(yfinance 실패 시)을 안내한다.
+### 구현 불변 규칙 (스크립트 수정 시 유지 — 실제 버그에서 나온 규칙)
 
-## 참고
+1. **duration 필터**: 같은 계정에 3/6/9/12개월 값이 섞여 오므로 (end−start) 일수로 분기(80~100일)/연간(350~380일)을 거른다. **BS(instant)는 duration 계정의 실제 날짜 집합에 매칭되는 것만** 각 축에 넣는다(진행 분기말 스냅샷이 연간에 섞이는 버그 방지).
+2. **4분기 파생**: 10-K에는 Q4 3개월 값이 보통 없다. 같은 회계연도 분기 3개가 있을 때만 Q4 = 연간−(Q1+Q2+Q3)로 파생하고, 3개가 안 모이면 지어내지 않는다. 주당 지표(EPS)는 파생하지 않는다.
+3. **태그 후보 병합**: 첫 매칭 태그에서 멈추지 말고, 앞 태그가 비운 날짜만 뒤 태그로 보충한다(회사가 연도별로 다른 태그를 쓰는 경우 대비). 같은 (end, 기간)에 여러 공시가 있으면 **filed 최신** 값(정정 반영).
+4. **EPS는 백만달러 환산 금지**(`PER_SHARE_KEYS`) — 위반 시 PER가 100만 배 틀어진다. 단위 폴백: USD → USD/shares.
+5. PER/PBR/PSR은 완제품(trailingPE)을 믿지 않고 SEC 재무값+주가로 직접 수식 계산한다.
+6. 빈 값은 0이 아니라 빈 칸/NA()(차트 끊김), 조정 계수는 셀 참조, 콤보 차트는 1차=막대+보조축=꺾은선, 실효세율은 세전이익≤0이면 NA·0~50% 클램프, 차트 열은 동적 계산 — KR "구현 불변 규칙"과 동일.
+7. **N섹션 판정에서 순이익·자본이 0 이하인 연도의 PER/PBR은 제외**한다(음수 배수가 "저평가 충족"으로 오판되는 버그 방지).
+8. 시트 라벨·레이아웃(지표 시트의 "지표" 헤더, 투자분석 L섹션의 종가/시가총액 행 등)은 **investment-thesis-writer·valuation-verdict가 그대로 읽는 계약**이다 — 바꾸면 그 두 스킬이 조용히 빈 시트를 만든다.
 
-### v3.0.0 (SEC EDGAR 전환)
+## 테스트
 
-1. **데이터 소스 교체**: yfinance(재무제표) → SEC EDGAR CompanyFacts API. 계정 매칭을 문자열 인덱스 이름 추측(yfinance)에서 XBRL 표준 태그(SEC, DART와 같은 원리)로 전환해 더 견고해졌다.
-2. **실제로 잡은 버그**: BS(재무상태표, instant) 항목을 quarterly/annual 구분 없이 그대로 양쪽에 넣었다가, 아직 10-K가 없는 진행 중인 분기말 스냅샷이 "연간" 쪽에 섞여 들어가는 문제가 실제 테스트로 재현됐다. IS/CF(duration)의 실제 날짜 집합과 매칭시켜 수정.
-3. **실제로 잡은 버그 2**: EPS(주당 지표)에 다른 계정과 동일하게 백만달러 단위 환산(÷1,000,000)을 적용해서 PER이 45,000,000배로 나오는 버그가 있었다. `PER_SHARE_KEYS`로 예외 처리.
-4. **PER/PBR/PSR을 직접 수식으로 계산**: yfinance의 이미 계산된 `trailingPE` 등을 그대로 믿지 않고, SEC 재무제표 값(EPS/자본총계/매출액)과 주가를 조합해 우리가 직접 수식을 만든다(감사 가능성 원칙 강화).
-5. yfinance 의존 범위를 "재무제표 전체"에서 "현재 주가 하나"로 최소화 — 이제 Yahoo가 또 차단해도 핵심 산출물(재무제표)은 영향받지 않는다.
-6. 이 환경(claude.ai 채팅)에서 `data.sec.gov` 자체도 네트워크 허용목록에 없어 라이브 검증은 못 했다. 웹 검색으로 확인한 XBRL 태그 구조로 구현했고, SEC CompanyFacts 응답 형식과 동일한 합성 데이터로 전체 파이프라인(분기/연간 분리, PER/PBR/PSR 계산, 비교 워크북)을 실행·재계산까지 검증했다.
-
-### 알려진 한계
-
-- CIK가 없는 비상장/신규 상장 기업, 또는 SEC 매핑에 아직 없는 회사는 지원 안 됨.
-- 투자분석의 "간이 투자판단"은 재무비율 3개만 보는 단순 규칙이다(DART의 N섹션만큼 정교하지 않음).
-- investment-thesis-writer·버핏멍거_가치평가 스타일의 정성분석/DCF 확장은 아직 없다.
+```
+cd plugins/valuation-verdict/skills/valuation-verdict && python -m unittest discover -s tests -v
+```
+합성 SEC 픽스처(FAKE)가 이 플러그인의 수집·워크북 경로까지 함께 검증한다.

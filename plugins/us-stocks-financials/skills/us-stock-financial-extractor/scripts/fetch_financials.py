@@ -57,11 +57,32 @@ ACCOUNTS = {
     "매출채권": ("balance_sheet", ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"], "매출채권"),
     "유형자산": ("balance_sheet", ["PropertyPlantAndEquipmentNet"], "유형자산(PP&E)"),
 
+    "매입채무": ("balance_sheet", ["AccountsPayableCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent", "AccountsPayableTradeCurrent"], "매입채무"),
+    "단기투자": ("balance_sheet", ["ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"], "단기투자(유가증권)"),
+    "장기투자": ("balance_sheet", ["LongTermInvestments", "MarketableSecuritiesNoncurrent", "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent"], "장기투자자산"),
+    "무형자산": ("balance_sheet", ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"], "무형자산"),
+    "영업권": ("balance_sheet", ["Goodwill"], "영업권"),
+    "기타유동자산": ("balance_sheet", ["OtherAssetsCurrent"], "기타유동자산"),
+    "이익잉여금": ("balance_sheet", ["RetainedEarningsAccumulatedDeficit"], "이익잉여금"),
+
     "영업활동현금흐름": ("cash_flow", ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "영업활동현금흐름"),
-    "설비투자": ("cash_flow", ["PaymentsToAcquirePropertyPlantAndEquipment"], "설비투자(CapEx)"),
-    "감가상각비": ("cash_flow", ["DepreciationDepletionAndAmortization", "DepreciationAmortizationAndAccretionNet", "Depreciation"], "감가상각비(D&A)"),
+    "설비투자": ("cash_flow", ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"], "유형자산의취득"),
+    "투자활동현금흐름": ("cash_flow", ["NetCashProvidedByUsedInInvestingActivities", "NetCashProvidedByUsedInInvestingActivitiesContinuingOperations"], "투자활동현금흐름"),
+    "재무활동현금흐름": ("cash_flow", ["NetCashProvidedByUsedInFinancingActivities", "NetCashProvidedByUsedInFinancingActivitiesContinuingOperations"], "재무활동현금흐름"),
+    "감가상각비": ("cash_flow", ["DepreciationDepletionAndAmortization", "DepreciationAmortizationAndAccretionNet", "DepreciationAndAmortization", "Depreciation"], "감가상각비(D&A)"),
     "배당금지급": ("cash_flow", ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"], "배당금지급"),
+    "현금및현금성자산의증가": ("cash_flow", [
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+        "CashAndCashEquivalentsPeriodIncreaseDecrease",
+        "CashAndCashEquivalentsPeriodIncreaseDecreaseExcludingExchangeRateEffect",
+    ], "현금및현금성자산의증가"),
+    "외화환산손익": ("income_statement", ["ForeignCurrencyTransactionGainLossBeforeTax"], "외화환산손익"),
 }
+
+# 주당(per-share) 계정: 백만달러 환산 금지 + 분기 파생(Q4=연간−3개 분기 합) 대상 제외
+PER_SHARE_KEYS = {"EPS(희석)"}
+# 회사에 따라 아예 없는 게 정상인 계정 — 매칭 실패 경고에서 제외
+OPTIONAL_KEYS = {"외화환산손익", "단기투자", "장기투자", "무형자산", "영업권", "기타유동자산", "매입채무", "이자비용", "현금및현금성자산의증가"}
 
 INSTANT_KEYS = {k for k, (sj, *_r) in ACCOUNTS.items() if sj == "balance_sheet"}
 
@@ -130,6 +151,42 @@ def _duration_days(fact: dict) -> int | None:
         return None
 
 
+def _unit_facts(concept: dict) -> list[dict]:
+    """USD 단위를 우선 쓰되, EPS처럼 USD/shares(또는 shares) 단위만 있는 계정도 지원한다."""
+    units = concept.get("units", {})
+    for u in ("USD", "USD/shares", "shares"):
+        if units.get(u):
+            return units[u]
+    return []
+
+
+def _best_points(facts: list[dict], want_instant: bool) -> tuple[dict[str, float], dict[str, float]]:
+    """(quarterly {end: val}, annual {end: val}) — 같은 end에 여러 공시(원공시·비교표·정정)가
+    있으면 filed가 가장 최신인 값을 쓴다(정정공시 반영)."""
+    q: dict[str, tuple[str, float]] = {}
+    a: dict[str, tuple[str, float]] = {}
+    for fact in facts:
+        val, end, filed = fact.get("val"), fact.get("end"), fact.get("filed", "")
+        if val is None or end is None:
+            continue
+        if want_instant:
+            if "start" in fact:
+                continue
+            # instant는 분기/연간 구분이 없으므로 임시로 양쪽에 후보를 둔다(호출부에서 날짜 매칭)
+            if end not in a or filed >= a[end][0]:
+                a[end] = (filed, float(val))
+            continue
+        dur = _duration_days(fact)
+        if dur is None:
+            continue
+        bucket = q if 80 <= dur <= 100 else a if 350 <= dur <= 380 else None
+        if bucket is None:
+            continue
+        if end not in bucket or filed >= bucket[end][0]:
+            bucket[end] = (filed, float(val))
+    return {k: v for k, (_, v) in q.items()}, {k: v for k, (_, v) in a.items()}
+
+
 def _collect_duration_dates(raw_facts: dict) -> tuple[set[str], set[str]]:
     """IS/CF(duration) 계정들에서 실제 존재하는 "연간(FY, 350~380일)"과
     "분기(80~100일)" 날짜(end) 집합을 구한다. BS(instant) 항목은 이 날짜
@@ -146,10 +203,7 @@ def _collect_duration_dates(raw_facts: dict) -> tuple[set[str], set[str]]:
             concept = us_gaap.get(tag)
             if not concept:
                 continue
-            usd_facts = concept.get("units", {}).get("USD")
-            if not usd_facts:
-                continue
-            for fact in usd_facts:
+            for fact in _unit_facts(concept):
                 end = fact.get("end")
                 dur = _duration_days(fact)
                 if end is None or dur is None:
@@ -158,7 +212,6 @@ def _collect_duration_dates(raw_facts: dict) -> tuple[set[str], set[str]]:
                     quarterly_dates.add(end)
                 elif 350 <= dur <= 380:
                     annual_dates.add(end)
-            break  # 첫 매칭 태그만 봐도 날짜 집합 추정엔 충분
     return annual_dates, quarterly_dates
 
 
@@ -171,51 +224,73 @@ def extract_periods(raw_facts: dict, key: str, annual_dates: set[str], quarterly
     is_instant = key in INSTANT_KEYS
     us_gaap = raw_facts.get("facts", {}).get("us-gaap", {})
 
+    out_q: dict[str, float] = {}
+    out_a: dict[str, float] = {}
+    # 태그 후보를 순서대로 훑되, 앞 태그가 채우지 못한 날짜만 뒤 태그로 보충한다.
+    # (예: Revenues가 구연도에만 있고 최근 연도는 RevenueFromContract…에만 있는 회사 —
+    # 첫 매칭 태그에서 끝내면 최근 연도 매출이 통째로 비는 실제 문제의 방지책)
     for tag in candidates:
         concept = us_gaap.get(tag)
         if not concept:
             continue
-        usd_facts = concept.get("units", {}).get("USD")
-        if not usd_facts:
+        facts = _unit_facts(concept)
+        if not facts:
             continue
-        out_q: dict[str, float] = {}
-        out_a: dict[str, float] = {}
-        for fact in usd_facts:
-            val = fact.get("val")
-            end = fact.get("end")
-            if val is None or end is None:
-                continue
-            if is_instant:
+        t_q, t_a = _best_points(facts, is_instant)
+        if is_instant:
+            # instant는 duration 계정들의 실제 연간/분기 날짜에 매칭되는 것만 채택
+            for end, v in t_a.items():
                 if end in annual_dates:
-                    out_a[end] = val
+                    out_a.setdefault(end, v)
                 if end in quarterly_dates:
-                    out_q[end] = val
-            else:
-                dur = _duration_days(fact)
-                if dur is None:
-                    continue
-                if 80 <= dur <= 100:
-                    out_q[end] = val
-                elif 350 <= dur <= 380:
-                    out_a[end] = val
-        if out_q or out_a:
-            return {"quarterly": out_q, "annual": out_a}
-    return {"quarterly": {}, "annual": {}}
+                    out_q.setdefault(end, v)
+        else:
+            for end, v in t_q.items():
+                out_q.setdefault(end, v)
+            for end, v in t_a.items():
+                out_a.setdefault(end, v)
+    return {"quarterly": out_q, "annual": out_a}
+
+
+def _derive_q4(q: dict[str, float], a: dict[str, float]) -> dict[str, float]:
+    """10-K에는 4분기 단독(3개월) 값이 보통 없다. 같은 회계연도의 분기 3개(Q1~Q3)가
+    있으면 Q4 = 연간 − (Q1+Q2+Q3)로 파생한다. 3개가 안 모이면 지어내지 않고 건너뛴다."""
+    derived = {}
+    for end_a, val_a in a.items():
+        if end_a in q:
+            continue
+        try:
+            d_a = date.fromisoformat(end_a)
+        except ValueError:
+            continue
+        in_fy = [v for e, v in q.items()
+                 if 0 < (d_a - date.fromisoformat(e)).days <= 340]
+        if len(in_fy) == 3:
+            derived[end_a] = val_a - sum(in_fy)
+    return derived
 
 
 def build_frequency_payload(raw_facts: dict, frequency: str, n_periods: int) -> dict:
     """extract_periods 결과를 build_workbook.py가 기대하는
-    {sj: {key: {period: val}}} 형태로 재구성하고, 최근 n_periods개만 남긴다."""
+    {sj: {key: {period: val}}} 형태로 재구성하고, 최근 n_periods개만 남긴다.
+    frequency="quarterly"면 Q4를 연간−(Q1~Q3)로 파생하고(주당 지표 제외),
+    그 회계연도말 BS 스냅샷도 분기 축에 포함시킨다."""
     annual_dates, quarterly_dates = _collect_duration_dates(raw_facts)
+    if frequency == "quarterly":
+        # Q4 파생이 가능한 회계연도말 날짜를 분기 날짜 집합에 추가(BS 매칭용)
+        quarterly_dates = set(quarterly_dates) | set(annual_dates)
     result = {"income_statement": {}, "balance_sheet": {}, "cash_flow": {}}
     all_dates: set[str] = set()
     per_key: dict[str, dict[str, float]] = {}
     for key, (sj, _cand, _label) in ACCOUNTS.items():
         periods = extract_periods(raw_facts, key, annual_dates, quarterly_dates)
-        series = periods[frequency]
+        series = dict(periods[frequency])
+        if frequency == "quarterly" and key not in INSTANT_KEYS and key not in PER_SHARE_KEYS:
+            series.update(_derive_q4(periods["quarterly"], periods["annual"]))
         per_key[key] = series
-        all_dates.update(series.keys())
-
+        if key not in INSTANT_KEYS:
+            all_dates.update(series.keys())
+    # 기간 축은 유량(duration) 계정이 실제로 존재하는 날짜만 사용(BS 스냅샷 단독 날짜 방지)
     sorted_dates = sorted(all_dates)[-n_periods:] if n_periods else sorted(all_dates)
     for key, (sj, _cand, _label) in ACCOUNTS.items():
         series = per_key.get(key, {})

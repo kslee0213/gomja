@@ -197,8 +197,16 @@ def make_sec(cache: Path) -> None:
         for tag, v in (("Assets", rev * 1.5), ("AssetsCurrent", rev * 0.6), ("Liabilities", rev * 0.8), ("LiabilitiesCurrent", rev * 0.35),
                        ("StockholdersEquity", rev * 0.7), ("CashAndCashEquivalentsAtCarryingValue", rev * 0.2),
                        ("LongTermDebtNoncurrent", rev * 0.25), ("InventoryNet", rev * 0.05), ("AccountsReceivableNetCurrent", rev * 0.1),
-                       ("PropertyPlantAndEquipmentNet", rev * 0.4)):
+                       ("PropertyPlantAndEquipmentNet", rev * 0.4), ("RetainedEarningsAccumulatedDeficit", rev * 0.5),
+                       ("AccountsPayableCurrent", rev * 0.08), ("ShortTermInvestments", rev * 0.1),
+                       ("IntangibleAssetsNetExcludingGoodwill", rev * 0.03), ("Goodwill", rev * 0.06), ("OtherAssetsCurrent", rev * 0.02)):
             add(tag, None, y1, v, "10-K", filed_k, fy, "FY", frame=f"CY{fy}Q4I")
+        for tag, v in (("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", pbt),
+                       ("InterestExpense", rev * 0.005),
+                       ("NetCashProvidedByUsedInInvestingActivities", -(capex + rev * 0.01)),
+                       ("NetCashProvidedByUsedInFinancingActivities", -(ni * 0.3)),
+                       ("CashAndCashEquivalentsPeriodIncreaseDecrease", ocf - capex - ni * 0.3)):
+            add(tag, y0, y1, v, "10-K", filed_k, fy, "FY", frame=f"CY{fy}")
         # 분기(10-Q) Q1~Q3 — 3개월 단독 + BS 스냅샷
         for q, (qs, qe) in enumerate((("01-01", "03-31"), ("04-01", "06-30"), ("07-01", "09-30")), start=1):
             filed_q = f"{fy}-{int(qe[:2]) + 1:02d}-05"
@@ -212,10 +220,14 @@ def make_sec(cache: Path) -> None:
         "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
             {"end": "2025-12-31", "val": shares, "fy": 2025, "fp": "FY", "form": "10-K", "filed": "2026-02-01"}]}}}}}
     (cache / f"secfacts_{ticker}.json").write_text(json.dumps({"ticker": ticker, "cik": "0000000001", "fetched_at": "2026-08-31", "raw": raw}), encoding="utf-8")
+    monthly = {}
+    for fy, g in growth.items():
+        monthly[f"{fy}-12"] = round(60.0 * g * 1.3, 2)  # 회계연도말(12월) 종가 가정
     (cache / f"price_{ticker}.json").write_text(json.dumps({"ticker": ticker, "price": {
-        "currentPrice": 150.0, "marketCap": 150.0 * shares, "sharesOutstanding": shares,
-        "fiftyTwoWeekHigh": 170.0, "fiftyTwoWeekLow": 110.0, "dividendYield": 0.008, "payoutRatio": 0.2},
-        "errors": [], "fetched_at": "2026-08-31T09:00:00"}), encoding="utf-8")
+        "currentPrice": 150.0, "priceDate": "2026-09-05", "marketCap": 150.0 * shares, "sharesOutstanding": shares,
+        "fiftyTwoWeekHigh": 170.0, "fiftyTwoWeekLow": 110.0, "dividendYield": 0.008, "dividendRate": 1.2, "payoutRatio": 0.2},
+        "monthly_close": monthly, "dividends_by_year": {str(y): round(0.2 * (ni_ := 1) + 1.0, 2) for y in growth},
+        "errors": [], "fetched_at": "2026-09-05T09:00:00"}), encoding="utf-8")
     (cache / f"company_{ticker}.json").write_text(json.dumps({"ticker": ticker, "cik": "0000000001", "title": "Fake Corp"}), encoding="utf-8")
     print(f"SEC fixture written to {cache}")
 

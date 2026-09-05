@@ -532,11 +532,20 @@ def load_xlsx(path: str, years: int = 5) -> FinInput:
         wb = load_workbook(path2, data_only=True)
         ws = wb["연간_재무제표"]
     ia = wb["투자분석"] if "투자분석" in wb.sheetnames else None
-    is_us = ia is not None and _find_row(ia, "현재가($)", 1) is not None
+
+    # 시장 판별: 단위 표기(백만달러)가 있으면 US, 아니면 KR. (v4.0.0부터 US 워크북도
+    # KR과 동일한 시트 레이아웃·라벨을 쓰므로 파싱 경로는 공용이고 단위만 다르다.)
+    a1 = str(ws["A1"].value or "")
+    is_us = ("백만달러" in a1) or (ia is not None and _find_row(ia, "현재가($)", 1, contains=True) is not None)
     company = Path(path).stem.split("_")[0]
     if ia is not None and ia["A1"].value and "—" in str(ia["A1"].value):
         company = str(ia["A1"].value).split("—", 1)[1].strip()
         company = re.sub(r"\s*\([A-Z.\-]+\)$", "", company)  # US: "Fake Corp (FAKE)" → "Fake Corp"
+
+    if is_us:
+        fi = FinInput(company=company, market="US", currency="USD", amount_unit=1e6, unit_label="백만달러", source=f"xlsx:{path}")
+    else:
+        fi = FinInput(company=company, market="KR", currency="KRW", amount_unit=1e8, unit_label="억원", source=f"xlsx:{path}")
 
     labels = []
     c = 3
@@ -552,38 +561,8 @@ def load_xlsx(path: str, years: int = 5) -> FinInput:
             return [None] * len(labels)
         return [_num(ws.cell(r, 3 + off + i).value) for i in range(len(labels))]
 
-    if is_us:
-        fi = FinInput(company=company, market="US", currency="USD", amount_unit=1e6, unit_label="백만달러", source=f"xlsx:{path}")
-        lab = {"revenue": "매출액", "op": "영업이익", "ni": "당기순이익", "ni_parent": "당기순이익", "equity": "자본총계", "equity_parent": "자본총계",
-               "assets": "자산총계", "liabilities": "부채총계", "cash": "현금및현금성자산", "ocf": "영업활동현금흐름",
-               "capex": "설비투자(CapEx)", "da": "감가상각비(D&A)", "dividends_paid": "배당금지급"}
-        for k, l in lab.items():
-            v = row_vals(_find_row(ws, l, 2))
-            fi.s[k] = [abs(x) if (x is not None and k in ("capex", "dividends_paid")) else x for x in v]
-        fi.s["borrowings"] = [None] * len(labels)
-        fi.warnings.append("xlsx 소스에는 차입금·비지배지분 구분이 없어 자본총계/당기순이익 전체를 지배주주 값으로 간주")
-        fi.years = labels
-        if ia is not None:
-            r = _find_row(ia, "현재가($)", 1, contains=True)
-            fi.price = _num(ia.cell(r, 3).value) if r else None
-            m = re.search(r"기준 (\d{4}-\d{2}-\d{2})", str(ia.cell(r, 1).value)) if r else None
-            fi.price_date = _yyyymmdd(m.group(1)) if m else None
-            r = _find_row(ia, "시가총액(백만달러)", 1)
-            mc = _num(ia.cell(r, 3).value) if r else None
-            if mc and fi.price:
-                fi.shares = mc * 1e6 / fi.price
-            r = _find_row(ia, "배당수익률(%)", 1)
-            dy = _num(ia.cell(r, 3).value) if r else None
-            if dy is not None and fi.price:
-                fi.dps = fi.price * dy / 100
-        fi.hist_price = [None] * len(labels)
-        if fi.price_date is None:
-            fi.warnings.append("미국 워크북에 주가 기준일이 기록돼 있지 않습니다(yfinance 조회 시점)")
-        return fi
-
-    # --- KR ---
-    fi = FinInput(company=company, market="KR", currency="KRW", amount_unit=1e8, unit_label="억원", source=f"xlsx:{path}")
-    # 연간_재무제표의 B열(계정명)을 DART 규칙으로 매칭
+    # 연간_재무제표의 계정명(col B)을 DART 이름 규칙으로 매칭 — US 워크북(v4.0.0)의
+    # 한국어 라벨(매출액·영업이익·유형자산의취득 등)도 같은 규칙으로 잡힌다.
     items_by_row = []
     for r in range(hdr + 1, ws.max_row + 1):
         nm = ws.cell(r, 2).value
@@ -609,7 +588,7 @@ def load_xlsx(path: str, years: int = 5) -> FinInput:
             used = False
             for r, nm in items_by_row:
                 nn = nm.replace(" ", "")
-                if any(b in nn for b in ("차입금", "사채")) and not any(x in nn for x in ("상환", "비용", "이자", "발행", "증가", "감소")):
+                if (any(b in nn for b in ("차입금", "사채")) or nn in ("단기금융부채", "장기금융부채", "유동성장기금융부채")) and not any(x in nn for x in ("상환", "비용", "이자", "발행", "증가", "감소")):
                     vals = row_vals(r)
                     if any(v is not None for v in vals):
                         used = True
@@ -620,6 +599,9 @@ def load_xlsx(path: str, years: int = 5) -> FinInput:
         fi.s[k] = [abs(x) if (x is not None and k in ("capex", "dividends_paid")) else x for x in v]
     fi.years = labels
     fi.estimated_last = bool(labels and labels[-1].endswith("(E)"))
+    if is_us and all(v is None for v in fi.s.get("ni_parent", [])):
+        fi.notes.append("미국 워크북의 당기순이익(NetIncomeLoss)은 지배주주 귀속값입니다")
+
     if ia is not None:
         r_close, r_mc, r_date = _find_row(ia, "종가", 1), _find_row(ia, "시가총액", 1), _find_row(ia, "기준일(종가)", 1)
         n_ia = 0
@@ -628,15 +610,32 @@ def load_xlsx(path: str, years: int = 5) -> FinInput:
                 n_ia += 1
         if r_close and n_ia:
             fi.hist_price = [_num(ia.cell(r_close, 3 + off + i).value) for i in range(len(labels))]
-            fi.price = fi.hist_price[-1]
+            fi.price = next((v for v in reversed(fi.hist_price) if v is not None), None)
             if r_date:
                 fi.price_date = _yyyymmdd(str(ia.cell(r_date, 3 + off + len(labels) - 1).value))
             mc = _num(ia.cell(r_mc, 3 + off + len(labels) - 1).value) if r_mc else None
             if mc and fi.price:
-                fi.shares = mc * 1e8 / fi.price
+                fi.shares = mc * fi.amount_unit / fi.price
+        # US(v4.0.0): 회계연도말 종가와 별도로 '현재가($)' 블록이 있으면 그것을 현재가로 쓴다
+        r_cur = _find_row(ia, "현재가($)", 1, contains=True)
+        if r_cur:
+            cur = _num(ia.cell(r_cur, 3).value)
+            if cur is not None:
+                fi.price = cur
+                m = re.search(r"기준 (\d{4}-\d{2}-\d{2})", str(ia.cell(r_cur, 1).value))
+                fi.price_date = _yyyymmdd(m.group(1)) if m else fi.price_date
+                r_mc2 = _find_row(ia, "시가총액(백만달러", 1, contains=True)
+                mc2 = _num(ia.cell(r_mc2, 3).value) if r_mc2 else None
+                if mc2:
+                    fi.shares = mc2 * fi.amount_unit / fi.price
         r = _find_row(ia, "주당 현금배당금", 1)
         if r:
             fi.dps = _num(ia.cell(r, 2).value)
+        if fi.dps is None:
+            r = _find_row(ia, "배당수익률(%)", 1)
+            dy = (_num(ia.cell(r, 2).value) or _num(ia.cell(r, 3).value)) if r else None
+            if dy is not None and fi.price:
+                fi.dps = fi.price * dy / 100
         r = next((rr for rr in range(1, ia.max_row + 1) if str(ia.cell(rr, 1).value or "").startswith("청산가치 (")), None)
         if r:
             fi.liquidation_value = _num(ia.cell(r, 3).value)
