@@ -284,6 +284,11 @@ def assign_weights(fi: FinInput, methods: list[MethodResult], a: Assumptions, p:
         if not by["earnings"].applicable:
             w = {"asset": .5, "earnings": 0, "dcf": .3, "rim": .2, "ddm": 0}
             why = "최근 순이익 적자 → 수익가치 제외, 자산가치 비중 확대"
+        elif roe_norm is not None and roe_norm > 0.40:
+            # 대규모 자사주 매입 등으로 장부가가 인위적으로 축소된 회사(애플 등 ROE 40%+)는
+            # BPS 기반 방법(자산가치·RIM)이 실체 없는 값을 낸다 — 수익·현금흐름 중심으로 재배분
+            w = {"asset": 0, "earnings": .45, "dcf": .45, "rim": .10, "ddm": 0}
+            why = f"정상화 ROE {roe_norm * 100:.0f}%(>40%) — 장부가가 축소된 기업이라 자산가치 제외·RIM 축소, 수익·현금흐름 중심"
         elif pbr_now is not None and pbr_now < 0.7 and roe_norm is not None and roe_norm < 0.06:
             w = {"asset": .40, "earnings": .20, "dcf": .20, "rim": .20, "ddm": 0}
             why = "PBR<0.7·ROE<6%(자산주 성격) → 자산가치 비중 확대"

@@ -471,9 +471,34 @@ def load_sec(cache_dir: str, ticker: str, years: int = 5) -> FinInput:
                 sh = _num(info.get("sharesOutstanding"))
                 if sh:
                     fi.notes.append("주식수: yfinance sharesOutstanding")
-            dy = _num(info.get("dividendYield"))
-            if dy is not None and fi.price:
-                fi.dps = fi.price * (dy if dy < 1 else dy / 100)
+            # DPS 우선순위: dividendRate(주당 $) → dividends_by_year 최근 완결연도 → 수익률 역산(단위 모호해 최후순위)
+            dr = _num(info.get("dividendRate"))
+            if dr is not None:
+                fi.dps = dr
+            else:
+                dby = p.get("dividends_by_year") or {}
+                if dby:
+                    years_full = sorted(dby)[:-1] or sorted(dby)  # 진행 중인 올해는 제외
+                    fi.dps = _num(dby[years_full[-1]])
+                else:
+                    dy = _num(info.get("dividendYield"))
+                    if dy is not None and fi.price:
+                        fi.dps = fi.price * (dy if dy < 1 else dy / 100)
+                        fi.warnings.append("DPS를 배당수익률에서 역산(단위 모호) — dividendRate 수집을 권장")
+            # 회계연도말 종가 이력(월말 종가) → 과거 PER 밴드·목표 PER 자동 산정에 사용
+            monthly = p.get("monthly_close") or {}
+            if monthly:
+                hp = []
+                for e in ends:
+                    ym = e[:7]
+                    px = monthly.get(ym)
+                    if px is None:
+                        y_, m_ = int(ym[:4]), int(ym[5:7])
+                        m2, y2 = (m_ - 1, y_) if m_ > 1 else (12, y_ - 1)
+                        px = monthly.get(f"{y2:04d}-{m2:02d}")
+                    hp.append(round(float(px), 4) if px is not None else None)
+                fi.hist_price = hp
+                fi.notes.append("과거 주가: yfinance 월말 종가(회계연도말 매칭) — 과거 PER 밴드 산출에 사용")
         except (OSError, json.JSONDecodeError):
             pass
     if fi.price is None:
@@ -484,8 +509,9 @@ def load_sec(cache_dir: str, ticker: str, years: int = 5) -> FinInput:
         if last_div:
             fi.dps = last_div * 1e6 / sh
             fi.notes.append("DPS는 현금흐름표 배당금지급 ÷ 주식수로 근사")
-    fi.hist_price = [None] * len(fi.years)
-    fi.notes.append("미국 워크북에는 연도별 과거 주가가 없어 과거 PER 밴드는 산출하지 않음(목표 PER는 기본값/사용자 지정)")
+    if not fi.hist_price:
+        fi.hist_price = [None] * len(fi.years)
+        fi.notes.append("월말 종가 이력이 없어 과거 PER 밴드 미산출(목표 PER는 기본값/사용자 지정)")
     return fi
 
 
