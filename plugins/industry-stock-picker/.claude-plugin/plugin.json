@@ -1,0 +1,7 @@
+{
+  "name": "industry-stock-picker",
+  "version": "1.0.0",
+  "description": "\"투자할 만한 XX산업 기업 추천해줘\"에 답하는 역방향 파이프라인. 산업 내 상장사 6~8곳을 후보로 잡아 dart-kospi-financials/us-stocks-financials 캐시와 valuation-verdict 엔진으로 일괄 평가(적정주가·상승여력·판정·신뢰도 + ROE·부채비율·이익의질·FCF·성장·흑자연속)하고, 결측 분모제외 정규화 점수로 순위를 매긴 스크리닝 워크북을 만든 뒤 해자(정성) 리서치를 얹어 3곳을 추천합니다. 한국(DART/KRX)·미국(SEC/yfinance) 지원, 시장은 요청에서 지정.",
+  "author": {"name": "User"},
+  "keywords": ["종목 추천", "산업 스크리닝", "저평가 종목", "반도체", "조선", "우주", "가치투자", "그레이엄", "버핏", "멍거", "stock screener"]
+}

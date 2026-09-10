@@ -1,0 +1,33 @@
+{
+  "industry": "조선",
+  "candidates": [
+    {
+      "market": "KR",
+      "name": "HD한국조선해양",
+      "corp_code": "00164830",
+      "stock_code": "009540",
+      "why": "국내 조선 최상위 지주·중간지주(출처: ...)"
+    },
+    {
+      "market": "KR",
+      "name": "삼성중공업",
+      "corp_code": "00000000(corp_code_lookup으로 확정)",
+      "stock_code": "010140",
+      "why": "..."
+    },
+    {
+      "market": "US",
+      "name": "Huntington Ingalls",
+      "ticker": "HII",
+      "cik": "0001501585",
+      "why": "미국 최대 군함 조선(출처: ...)"
+    },
+    {
+      "market": "JSON",
+      "name": "테스트용 합성기업",
+      "input": "tests/fixture_good.json",
+      "assumptions": null,
+      "why": "테스트/외부 파이프라인 연동용 — 실사용에서는 쓰지 않음"
+    }
+  ]
+}
