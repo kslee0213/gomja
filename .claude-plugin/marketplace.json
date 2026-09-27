@@ -12,7 +12,7 @@
     {
       "name": "us-stocks-financials",
       "source": "./plugins/us-stocks-financials",
-      "description": "미국 나스닥/NYSE 상장 기업의 재무제표를 SEC EDGAR 공식 API(무료, 키 불필요)로 수집하고 현재가·주가 이력은 yfinance로 보강해 엑셀 분석 파일을 생성합니다."
+      "description": "미국 나스닥/NYSE 상장 기업의 재무제표를 SEC EDGAR 공식 API(무료, 키 불필요)로 수집해 dart-kospi-financials와 동일한 구성의 분석 엑셀을 생성합니다. 주가·배당은 yfinance를 최소한으로 사용합니다."
     },
     {
       "name": "valuation-verdict",

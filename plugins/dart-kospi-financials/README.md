@@ -6,11 +6,13 @@ KOSPI(코스피) 상장기업의 이름을 입력하면 금융감독원 DART Ope
 
 | 컴포넌트 | 이름 | 역할 |
 |---|---|---|
-| Skill | `dart-financial-extractor` | DART API 연동, 분기 실적 계산, 엑셀 작성 전체 워크플로우를 정의 |
+| Skill | `dart-financial-extractor` | DART API 연동, 분기 실적 계산, 엑셀 작성(재무제표·지표·투자분석 시트) 전체 워크플로우를 정의 |
+| Skill | `investment-thesis-writer` | DART 사업내용 원문 + 웹 리서치 + 투자분석 결과를 종합해 "투자판단 종합"·"버핏멍거_가치평가" 시트를 추가 (아래 "두 번째 스킬" 절 참조) |
 
-이 스킬은 내부적으로 Cowork의 코드 실행 환경(bash/python)을 사용해 `scripts/` 폴더의 스크립트를 순서대로 호출합니다:
+두 스킬 모두 내부적으로 Cowork의 코드 실행 환경(bash/python)을 사용해 각자의 `scripts/` 폴더 스크립트를 순서대로 호출합니다:
 - 단일 기업: `corp_code_lookup.py` → `fetch_financials.py` → (선택) `fetch_extra_disclosures.py` + `fetch_stock_price.py` → `build_workbook.py`
 - 여러 기업 비교: 마지막 단계만 `build_comparison_workbook.py`로 대체 (투자분석 시트는 비교 파일에는 포함되지 않습니다)
+- 정성 분석(investment-thesis-writer): `fetch_business_description.py` → Claude 웹 리서치·content.json 작성 → `build_thesis_sheet.py` / `build_valuation_sheet.py`
 
 엑셀 작성 단계에서는 Anthropic 기본 제공 `xlsx` 스킬의 규칙(서식, 수식 사용, recalc 검증)을 함께 따릅니다.
 
