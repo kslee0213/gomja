@@ -2,24 +2,31 @@
 
 이 문서는 플러그인을 "Claude 하네스" 형태로 볼 때, 어떤 **스킬(판단·오케스트레이션)**과
 어떤 **스크립트(결정론적 도구)**가 어떤 순서/책임으로 물리는지 정리한다.
+(기준 버전: plugin v0.19.0 — dart-financial-extractor 0.19.0, investment-thesis-writer 1.6.0)
 
 ## 1. 핵심 설계 원칙: 결정론 ↔ 비결정론 분리
 
 | 성격 | 담당 | 재현성 | 검증 방법 |
 |---|---|---|---|
-| **결정론(deterministic)** | `scripts/*.py` (API 호출, 분기계산, 엑셀 수식, 차트) | 같은 입력=같은 출력 | recalc.py + auditor 그룹 A/B |
-| **비결정론(non-deterministic)** | Claude가 하는 일: 웹 서치, 성장률·할인율 가정, 정성 텍스트 | 매번 달라짐 | **thesis-auditor** 그룹 C/D/E + 사람 검토 |
+| **결정론(deterministic)** | `scripts/*.py` (API 호출, 분기계산, 엑셀 수식, 차트) | 같은 입력=같은 출력 | `recalc.py`(수식 오류 0 확인) + `missing_indicators`(계정 매칭 실패 목록) |
+| **비결정론(non-deterministic)** | Claude가 하는 일: 웹 서치, 성장률·할인율 가정, 정성 텍스트 | 매번 달라짐 | SKILL.md의 "구현 불변 규칙" 준수 + 기본값 사용 시 "이 정보들은 정확하지 않습니다" 명시 + 사람 검토 |
 
-> 핵심: "매 요청마다 웹 서치 결과가 달라진다"는 문제는 **없앨 수 없고 붙잡아야 한다.**
-> 그래서 값을 고치지 않고 **표시(flag)만** 하는 독립 검수 게이트(thesis-auditor)를 둔다.
+> 핵심: "매 요청마다 웹 서치 결과가 달라진다"는 문제는 **없앨 수 없다.**
+> 그래서 값을 지어내지 않고, 가정과 출처를 산출물에 그대로 열거해 사람이 검토할 수 있게 한다.
 
-## 2. 스킬 3개 (역할 = 하네스의 '두뇌'/오케스트레이터)
+## 2. 스킬 2개 (역할 = 하네스의 '두뇌'/오케스트레이터)
 
 | 스킬 | 책임 | 결정론? |
 |---|---|---|
 | `dart-financial-extractor` | DART 수집 → 분기계산 → 엑셀(재무제표/지표/투자분석) 작성 오케스트레이션 | 대부분 결정론(스크립트 위임). 계정명 매칭만 후보탐색 |
 | `investment-thesis-writer` | 사업내용 원문 + **웹 서치** + 투자분석 결과 종합 → 정성 텍스트/가정 작성 → 시트 추가 | **비결정론 핵심** |
-| `thesis-auditor` (신규) | 위 두 스킬 산출물을 **전달 직전** 자동 검증, PASS/WARN/FAIL 리포트 | 결정론(웹 서치 안 함) |
+
+이 플러그인 밖의 별도 플러그인 `valuation-verdict`(스킬 `valuation-verdict`)가 파이프라인의 마지막 단계로
+연결된다(v0.18.0부터 "OO 년 분석해줘" 기본 파이프라인에 포함). 이 플러그인의 `cache/`와 워크북을 입력받아
+"가치평가_결론" 시트를 맨 앞에 추가한다.
+
+> 참고: 과거에 검수 게이트 스킬 `thesis-auditor`를 두었으나, 분기 연환산 기능과 함께 삭제했다
+> (dart-financial-extractor CHANGELOG 참조). 현재 검수는 위 표의 "검증 방법"대로 수행한다.
 
 ## 3. 스크립트 인벤토리 (역할 = 하네스의 '손·발' 도구)
 
@@ -40,21 +47,22 @@
 | `build_thesis_sheet.py` | 기존 xlsx + content.json | "투자판단 종합" 시트 추가 |
 | `build_valuation_sheet.py` | 기존 xlsx + content.json | "버핏멍거_가치평가" 시트 추가 |
 
-### thesis-auditor/scripts (신규)
+### (별도 플러그인) valuation-verdict/scripts
 | 스크립트 | 입력 | 출력 |
 |---|---|---|
-| `audit_workbook.py` | xlsx (+thesis/valuation content.json) | 검수 JSON + 리포트 md, 종료코드(FAIL=2/WARN=1/PASS=0) |
+| `valuation_verdict.py` | `--source dart` + cache 폴더 + corp_code (+ `--xlsx`, `--assumptions`) | "가치평가_결론" 시트 추가, `verdict_{회사}.json`, 마크다운 요약 |
+| `adapters.py` | dart/sec/xlsx/json 소스 | 정규화 입력(내부 모듈) |
 
 ## 4. 하네스 파이프라인 (전체 요청 처리 순서)
 
 ```
-[사용자 요청] "OO 년 분석 + 투자판단까지"
+[사용자 요청] "OO 년 분석해줘" (+ 투자판단까지)
         │
         ▼
 ┌─────────────────────────── dart-financial-extractor ───────────────────────────┐
 │ 1 corp_code_lookup.py        (결정론)                                            │
 │ 2 대상 연도/보고서 산정       (결정론)                                            │
-│ 3 fetch_financials.py ×N     (결정론, cache)                                     │
+│ 3 fetch_financials.py ×N     (결정론, cache; 진행연도 분기/반기 포함)             │
 │ 4 분기실적 계산 규칙          (결정론)                                            │
 │ 4-1 fetch_extra_disclosures / fetch_stock_price  (결정론, 선택)                  │
 │ 5 build_workbook.py --period annual  → 재무제표+지표+투자분석 시트  (결정론)      │
@@ -67,56 +75,48 @@
 │ c 투자분석 시트 수치 반영 → content.json 작성 ★비결정론(가정·텍스트)★             │
 │ d build_thesis_sheet.py / build_valuation_sheet.py  → 시트 추가  (결정론)        │
 └──────────────────────────────────────────────────────────────────────────────┘
-        │  ★★★ 전달 직전 게이트 ★★★
+        │
         ▼
-┌─────────────────────────────── thesis-auditor ─────────────────────────────────┐
-│ audit_workbook.py <xlsx> --thesis-content ... --valuation-content ...           │
-│   A 결정론 무결성(오류셀·회계항등식·현금흐름)                                     │
-│   B 단위 일관성(PER/시총/주식수 자릿수 — 과거 실제 버그 지점)                     │
-│   C 정량 vs 정성 모순(등급 D인데 "안정적" 등)   ← 비결정론 텍스트 검증            │
-│   D 가정 경계값(DCF 스프레드·영구성장률·성장률 리스트 길이/근거)                  │
-│   E 출처/재현성(sources 존재·URL·회사명 일치)   ← 웹 서치 검증                    │
-│                                                                                 │
-│   → PASS/WARN/FAIL 리포트                                                        │
-│      FAIL → 원인 고쳐 앞 단계 재실행 (또는 사용자 명시 승인 후 전달)              │
-│      WARN → "사람 확인 권장" 목록과 함께 전달 가능                                │
+┌──────────────────────── valuation-verdict (별도 플러그인) ──────────────────────┐
+│ e 가정(rf·β·ERP·목표 PER 등) 리서치 → assumptions.json   ★비결정론★             │
+│ f valuation_verdict.py --source dart --xlsx <워크북>  → "가치평가_결론" 시트 (결정론)│
+│   기본값을 쓴 가정은 결과에 열거하고 "이 정보들은 정확하지 않습니다" 표기          │
 └──────────────────────────────────────────────────────────────────────────────┘
         │
         ▼
-[전달] 엑셀 + 검수 리포트(md)를 함께 제공
+ recalc.py 로 수식 오류 0 확인 (결정론)
+        │
+        ▼
+[전달] 엑셀(7개 시트: 가치평가_결론·연간_재무제표·지표_연간·투자분석·원본데이터·
+       투자판단 종합·버핏멍거_가치평가) + 가정/기본값 목록
 ```
 
-## 5. 왜 검수 스킬이 "필요"한가 (결론)
+## 5. 검수에 대한 현재 입장
 
-- 기존 안전장치는 **결정론 영역**만 자동 검증한다: `recalc.py`(수식 오류), `missing_indicators`(계정 매칭 실패).
-- 그러나 v0.9~v1.4 릴리스 노트가 스스로 기록하듯, **실제 버그는 대부분 단위/가정/텍스트 경계**에서 났다:
-  - 시가총액 1억배 단위 꼬임 (v1.4.0에서 사후 발견)
-  - 기대성장률 %포인트 vs 분수 혼동 (v1.4.0)
-  - "재무건전성 D인데 안정적이라고 쓰면 안 된다"는 규칙은 SKILL.md 지침으로만 존재 → 자동 강제 없음
-  - DCF 발산(할인율−영구성장률<3%p)은 안내만 있고 게이트 없음
-- 게다가 **웹 서치 결과는 매 실행마다 달라져** 사람이 매번 전량 재검토하기 비현실적이다.
-- → 이 규칙들을 **전달 직전 자동 게이트**로 코드화한 것이 `thesis-auditor`다.
-  값을 고치지 않고 **잡아서 표시**만 하므로 검수의 독립성이 보장되고,
-  "자동으로 못 잡는 것(사실관계 진위 등)"은 정직하게 사람 검토로 넘긴다.
+- 자동 검증은 **결정론 영역**에 한정된다: `recalc.py`(수식 오류), `missing_indicators`(계정 매칭 실패).
+- 단위·가정·텍스트 경계에서 났던 과거 버그(시가총액 단위, 기대성장률 %p vs 분수, 등급과 정성 텍스트의 모순, DCF 발산 조건 등)는
+  각 SKILL.md의 "구현 불변 규칙"으로 승격해 두었고, 자동 게이트로 강제하지는 않는다.
+- 따라서 웹 서치·가정에 기반한 부분은 산출물에 출처·가정·기본값 사용 여부를 남기고, 최종 판단은 사람 검토로 넘긴다.
 
-## 6. 디렉터리 구조 (하네스 정리 후)
+## 6. 디렉터리 구조
 
 ```
 plugins/dart-kospi-financials/
-├── .claude-plugin/plugin.json            # v0.10.0 (auditor 반영)
+├── .claude-plugin/plugin.json            # v0.19.0
 ├── README.md
 ├── HARNESS.md                            # ← 이 문서
 └── skills/
     ├── dart-financial-extractor/         # [수집·계산·엑셀]  결정론 오케스트레이터
     │   ├── SKILL.md
+    │   ├── CHANGELOG.md
     │   ├── references/dart_api_reference.md
     │   └── scripts/ (corp_code_lookup, fetch_financials, fetch_extra_disclosures,
     │                 fetch_stock_price, build_workbook, build_comparison_workbook)
-    ├── investment-thesis-writer/         # [정성·가정·웹서치]  비결정론 작성기
-    │   ├── SKILL.md
-    │   ├── examples/ (thesis_content, valuation_content)
-    │   └── scripts/ (fetch_business_description, build_thesis_sheet, build_valuation_sheet)
-    └── thesis-auditor/                   # [검수 게이트]  결정론 검증기 (신규)
+    └── investment-thesis-writer/         # [정성·가정·웹서치]  비결정론 작성기
         ├── SKILL.md
-        └── scripts/audit_workbook.py
+        └── scripts/ (fetch_business_description, build_thesis_sheet, build_valuation_sheet)
+
+plugins/valuation-verdict/                # [결론]  별도 플러그인, 파이프라인 마지막 단계
+└── skills/valuation-verdict/ (SKILL.md, scripts/valuation_verdict.py, scripts/adapters.py,
+                               examples/, tests/)
 ```
